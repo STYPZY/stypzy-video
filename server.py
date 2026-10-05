@@ -1,6 +1,6 @@
 """Stypzy Video v2 - run: python server.py   (needs: python -m pip install -U yt-dlp)
 Files are prepared in a temp folder, then handed to the browser's own download flow."""
-import atexit, hashlib, hmac, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
+import atexit, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote, parse_qs
 from http.cookies import SimpleCookie
@@ -69,10 +69,9 @@ if ARIA2 and not os.path.isfile(ARIA2):
 SLOTS, ALLOWED_HOSTS, TERMINAL = threading.Semaphore(2), set(), ("completed", "cancelled", "error")
 TTL = 1800  # seconds a finished file stays available
 BROWSERS = ("chrome", "edge", "firefox", "brave", "opera", "chromium")
-SETTINGS, LATEST = {"browser": "", "cookies": False}, {"v": None}
-COOKIE_FILE = os.path.join(WORK, "cookies.txt")
+LATEST, SESS, SESS_LOCK = {"v": None}, {}, threading.Lock()   # SESS = per-tab login settings, wiped on refresh/close
 LAN = "--lan" in sys.argv     # opt-in: let other devices on your network use this server
-LOCAL_ONLY = ("/api/settings", "/api/update")   # only the host computer may change these
+LOCAL_ONLY = ("/api/update", "/api/login/test")   # only the computer running the app may use these
 
 # Hosted mode (Render sets RENDER=true; or set STYPZY_PUBLIC=1): password-protected, with limits.
 PUBLIC = bool(os.environ.get("RENDER") or os.environ.get("STYPZY_PUBLIC"))
@@ -87,6 +86,7 @@ if PUBLIC:
         print("NOTE: no APP_PASSWORD set, so anyone with the link can use this server.", flush=True)
 AUTH_COOKIE = hmac.new(APP_PASSWORD.encode(), b"stypzy-auth", hashlib.sha256).hexdigest() if APP_PASSWORD else ""
 FAILS = {}   # ip -> (failed logins, first failure time)
+IDLE = 1800 if PUBLIC else 21600   # seconds without activity before a tab's data is wiped
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stypzy Video - Sign in</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#070812;color:#f1f2fb;font:15px system-ui,sans-serif}
@@ -113,17 +113,105 @@ class StopRec(Exception):
     """Raised to end a live recording but keep what was captured."""
 
 
-def apply_auth(opts):
-    """Use the person's own login (cookies) so they can reach content their account can already watch."""
+def cookie_path(tab):
+    return os.path.join(WORK, "ck-" + hashlib.sha256(tab.encode()).hexdigest()[:24] + ".txt")
+
+
+def touch(tab):
+    """Mark a browser tab as active and return its private login settings."""
+    if not tab:
+        return None
+    with SESS_LOCK:
+        s = SESS.setdefault(tab, {"method": "none", "browser": "", "cookies": False, "domains": [], "count": 0})
+        s["seen"], s["close_at"] = time.time(), 0
+        return s
+
+
+def public_state(tab):
+    s = SESS.get(tab) or {}
+    return {k: s.get(k, d) for k, d in (("method", "none"), ("browser", ""), ("cookies", False), ("domains", []), ("count", 0))}
+
+
+def wipe_tab(tab):
+    """Forget everything about one tab: downloads, files, cookies and login choice."""
+    if not tab:
+        return
+    jobs.wipe_tab(tab)
+    with SESS_LOCK:
+        SESS.pop(tab, None)
+    try:
+        os.remove(cookie_path(tab))
+    except OSError:
+        pass
+
+
+def reaper():
+    while True:
+        time.sleep(5)
+        now = time.time()
+        for tab, s in list(SESS.items()):
+            closed = s.get("close_at") and now > s["close_at"] and s.get("seen", 0) < s["close_at"] - 12
+            if closed or now - s.get("seen", now) > IDLE:
+                wipe_tab(tab)
+
+
+def apply_auth(opts, tab=""):
+    """Use this tab's own login so it can reach content its account can already watch. Never shared between tabs."""
     if PROXY:
         opts["proxy"] = PROXY
-    if PUBLIC:
-        return opts   # never use a shared login on a public server
-    if SETTINGS["cookies"] and os.path.isfile(COOKIE_FILE):
-        opts["cookiefile"] = COOKIE_FILE
-    elif SETTINGS["browser"]:
-        opts["cookiesfrombrowser"] = (SETTINGS["browser"],)
+    s = SESS.get(tab)
+    if not s:
+        return opts
+    if s["method"] == "file" and s["cookies"] and os.path.isfile(cookie_path(tab)):
+        opts["cookiefile"] = cookie_path(tab)
+    elif s["method"] == "browser" and s["browser"] and not PUBLIC:
+        opts["cookiesfrombrowser"] = (s["browser"],)
     return opts
+
+
+def parse_cookies(txt):
+    """Validate a Netscape cookies.txt. Returns (cookie count, top domains)."""
+    if len(txt) > 1_500_000 or "\x00" in txt:
+        raise ValueError("That file is too large or isn't a text file.")
+    n, doms = 0, {}
+    for line in txt.splitlines():
+        if not line.strip() or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            raise ValueError("That isn't a Netscape-format cookies.txt (each line needs 7 tab-separated fields).")
+        d = parts[0].replace("#HttpOnly_", "").lstrip(".")
+        doms[d], n = doms.get(d, 0) + 1, n + 1
+    if not n:
+        raise ValueError("No cookies found in that file.")
+    return n, sorted(doms, key=doms.get, reverse=True)[:6]
+
+
+def test_browser_login(browser):
+    from yt_dlp.cookies import extract_cookies_from_browser
+    jar = extract_cookies_from_browser(browser, None, Silent())
+    doms = {}
+    for c in jar:
+        d = (c.domain or "").lstrip(".")
+        doms[d] = doms.get(d, 0) + 1
+    if not doms:
+        raise ValueError("That browser has no saved logins yet. Sign in to the site in that browser first.")
+    return sum(doms.values()), sorted(doms, key=doms.get, reverse=True)[:6]
+
+
+def check_url(url):
+    """On shared servers, refuse links that point at private networks (SSRF protection)."""
+    if not (PUBLIC or LAN):
+        return
+    host = urlparse(url).hostname or ""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        raise ValueError("Couldn't find that website. Check the link.")
+    for i in infos:
+        ip = ipaddress.ip_address(i[4][0].split("%")[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            raise ValueError("That address points to a private network and is blocked on this server.")
 
 
 def vtuple(v):
@@ -154,8 +242,33 @@ def salvage(staging):
 
 
 def clean_error(e):
-    lines = [re.sub(r"\x1b\[[0-9;]*m", "", l).strip() for l in str(e).splitlines() if l.strip()]
-    return "\n".join(lines[-3:]) or "Something went wrong."
+    out = []
+    for l in str(e).splitlines():
+        l = re.sub(r"^(ERROR:\s*)+", "", re.sub(r"\x1b\[[0-9;]*m", "", l).strip())   # yt-dlp prints "ERROR: ERROR:" twice
+        if l and (not out or out[-1] != l):
+            out.append(l)
+    return "\n".join(out[-3:]) or "Something went wrong."
+
+
+FRIENDLY = (
+    (("could not copy",), "login", "Your browser is still open, so Windows has locked its saved logins. Fully close that browser (also from the system tray), or choose Firefox, or upload a cookies.txt file instead."),
+    (("failed to decrypt", "dpapi", "app-bound", "v20 cookie"), "login", "This browser encrypts its cookies in a way this app cannot read (newer Chrome, Edge and Brave). Choose Firefox or upload a cookies.txt file instead."),
+    (("cookies database", "cookie database"), "login", "Couldn't find or open that browser's saved logins. Pick the browser you actually signed in with, or upload a cookies.txt file."),
+    (("login required", "sign in", "log in", "logged in", "private video", "confirm your age", "age-restricted", "members-only", "rate-limit reached", "empty media response", "--cookies"), "login", "This link needs you to be signed in. Open Login and updates and use a login from an account that is allowed to watch it."),
+    (("unsupported url", "no video formats"), "", "This link isn't supported or has no downloadable video."),
+    (("requested format is not available",), "", "That format isn't available for this video. Pick a different one."),
+    (("http error 403", "http error 429", "too many requests", "unable to extract", "nsig", "signature extraction", "sabr"), "update", "The site refused the request or changed how it works. Updating yt-dlp usually fixes this."),
+)
+
+
+def friendly(e):
+    """Plain-English message plus which settings fix to offer ('login', 'update' or '')."""
+    msg = clean_error(e)
+    low = msg.lower()
+    for needles, fix, text in FRIENDLY:
+        if any(n in low for n in needles):
+            return text, fix
+    return msg, ""
 
 
 def fmt_duration(sec):
@@ -167,7 +280,7 @@ def fmt_duration(sec):
 
 
 class Silent:
-    debug = info = warning = error = lambda self, _: None
+    debug = info = warning = error = lambda self, *a, **k: None
 
 
 class Live:
@@ -238,7 +351,7 @@ def build_options(job, d, staging):
         opts["hls_use_mpegts"] = True
     if pps:
         opts["postprocessors"] = pps
-    return apply_auth(opts)
+    return apply_auth(opts, job.get("tab", ""))
 
 
 class Jobs:
@@ -251,7 +364,7 @@ class Jobs:
                "thumb": thumb if thumb.startswith("http") else "", "label": str(d.get("label") or "")[:60],
                "status": "queued", "percent": 0, "speed": None, "eta": None, "message": "Waiting for a free slot",
                "error": "", "files": [], "created": time.time(), "finished": 0, "stages": 1, "staging": None,
-               "cancel": threading.Event(), "stop": threading.Event(), "live": d.get("mode") == "live", "data": d, "owner": owner}
+               "cancel": threading.Event(), "stop": threading.Event(), "live": d.get("mode") == "live", "data": d, "owner": owner, "tab": owner.partition(":")[2], "fix": ""}
         with self.lock:
             if sum(1 for j in self.items.values() if j["owner"] == owner and j["status"] not in TERMINAL) >= MAX_ACTIVE:
                 raise ValueError(f"You already have {MAX_ACTIVE} downloads in progress. Wait for one to finish.")
@@ -268,7 +381,7 @@ class Jobs:
         with self.lock:
             for k in [k for k, j in self.items.items() if j["status"] in TERMINAL and time.time() - j["finished"] > TTL]:
                 self.drop(k)
-            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner")},
+            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab")},
                      "files": [{"name": n, "size": s, "url": f"/file/{j['id']}/{j['dl']}/{i}"} for i, (n, s) in enumerate(j["files"])]}
                     for j in sorted(self.items.values(), key=lambda j: -j["created"]) if owner is None or j["owner"] == owner]
 
@@ -297,6 +410,14 @@ class Jobs:
             j["stop"].set()
             j["message"] = "Stopping and saving"
             return True
+
+    def wipe_tab(self, tab):
+        if not tab:
+            return
+        with self.lock:
+            for k in [k for k, j in self.items.items() if j["tab"] == tab]:
+                self.items[k]["cancel"].set()
+                self.drop(k)
 
     def clear(self, owner=None):
         with self.lock:
@@ -354,16 +475,17 @@ class Jobs:
             else:
                 if not isinstance(e, (DownloadError, ValueError, RuntimeError)):
                     log_crash("Unexpected download error")
-                self.finish(job, "error", "Download failed", error=clean_error(e))
+                msg, fix = friendly(e)
+                self.finish(job, "error", "Download failed", error=msg, fix=fix)
 
 
 jobs, searches = Jobs(), {}
 
 
-def do_search(rec, url):
+def do_search(rec, url, tab=""):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": Live(rec), "noplaylist": True,
             "extract_flat": "in_playlist", "playlistend": 25 if PUBLIC else 200}
-    with yt_dlp.YoutubeDL(apply_auth(opts)) as y:
+    with yt_dlp.YoutubeDL(apply_auth(opts, tab)) as y:
         info = y.extract_info(url, download=False)
     rec.update(message="Building the format list", percent=95)
     if info.get("_type") == "playlist":
@@ -398,11 +520,12 @@ def do_search(rec, url):
             "heights": sorted({r["height"] for r in vids if r["height"]}, reverse=True)}
 
 
-def run_search(rec, url):
+def run_search(rec, url, tab=""):
     try:
-        rec.update(result=do_search(rec, url), status="done", message="Done", percent=100)
+        rec.update(result=do_search(rec, url, tab), status="done", message="Done", percent=100)
     except BaseException as e:   # never let a search thread take the app down
-        rec.update(status="error", error=clean_error(e))
+        msg, fix = friendly(e)
+        rec.update(status="error", error=msg, fix=fix)
 
 
 atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
@@ -428,18 +551,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def sid(self):
         m = self.cookies().get("sv_sid")
-        return m.value[:64] if m else "anon"
+        return (re.sub(r"[^\w-]", "", m.value)[:64] or "anon") if m else "anon"
+
+    def tab(self):
+        t = self.headers.get("X-Tab", "")
+        return t if re.fullmatch(r"[A-Za-z0-9_-]{8,40}", t) else ""
+
+    def owner(self):
+        return f"{self.sid()}:{self.tab()}"
+
+    def is_local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def nocache(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
 
     def client_ip(self):
         fwd = self.headers.get("X-Forwarded-For", "")
-        return fwd.split(",")[0].strip() if (PUBLIC and fwd) else self.client_address[0]
+        return fwd.split(",")[-1].strip() if (PUBLIC and fwd) else self.client_address[0]   # last hop = the proxy-verified one
 
     def send_html(self, text, status=200):
         raw = text.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
+        self.nocache()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -470,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
+        self.nocache()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -502,7 +640,7 @@ class Handler(BaseHTTPRequestHandler):
         _, jid, dl, idx = path.split("/")[1:5]
         with jobs.lock:
             job = jobs.items.get(jid)
-            ok = bool(job and job["owner"] == self.sid() and job["dl"] == dl and idx.isdigit() and int(idx) < len(job["files"]))
+            ok = bool(job and job["owner"].partition(":")[0] == self.sid() and job["dl"] == dl and idx.isdigit() and int(idx) < len(job["files"]))
             if ok:
                 name, size = job["files"][int(idx)]
                 full = os.path.join(job["staging"], name)
@@ -516,6 +654,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
+            self.nocache()
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
             self.end_headers()
             shutil.copyfileobj(f, self.wfile, 1 << 20)
@@ -532,19 +671,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self.do_login()
             if path.startswith(("/api/", "/file/")) and not self.authed():
                 return self.send_json({"error": "Please sign in again (reload the page)."}, 401)
+            if path.startswith("/api/") and path not in ("/api/session/leave", "/api/session/end"):
+                touch(self.tab())
             if method == "GET":
                 if path == "/":
                     if not self.authed():
                         return self.send_html(LOGIN_HTML.replace("{{ERR}}", ""))
-                    page = open(os.path.join(HERE, "index.html"), encoding="utf-8").read().replace("{{TOKEN}}", TOKEN)
-                    if PUBLIC:   # hide the login/update drawer: those features are off on a public server
-                        page = page.replace("</head>", "<style>#pSet{display:none!important}</style></head>", 1)
+                    # Ctrl+Shift+R sends "Cache-Control: no-cache"; the page then wipes its previous session
+                    hard = "no-cache" in (self.headers.get("Cache-Control", "") + self.headers.get("Pragma", "")).lower()
+                    page = open(os.path.join(HERE, "index.html"), encoding="utf-8").read().replace("{{TOKEN}}", TOKEN).replace("{{FRESH}}", "1" if hard else "0")
                     raw = page.encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(raw)))
-                    self.send_header("Cache-Control", "no-store")
+                    self.nocache()
                     self.send_header("X-Frame-Options", "DENY")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
                     if "sv_sid" not in self.cookies():
                         self.send_header("Set-Cookie", f"sv_sid={secrets.token_urlsafe(16)}; Path=/; HttpOnly; SameSite=Lax" + ("; Secure" if PUBLIC else ""))
                     self.end_headers()
@@ -554,9 +698,12 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/info":
                     cur, new = yt_dlp.version.__version__, LATEST["v"]
                     return self.send_json({"ytdlp": cur, "latest": new, "update": bool(new and not PUBLIC and vtuple(new) > vtuple(cur)),
-                                           "ffmpeg": bool(FFMPEG), **SETTINGS})
+                                           "ffmpeg": bool(FFMPEG), "public": PUBLIC, "can_browser": not PUBLIC and self.is_local(),
+                                           "can_cookies": not PUBLIC or bool(APP_PASSWORD), **public_state(self.tab())})
+                if path == "/api/ping":
+                    return self.send_json({"ok": True})
                 if path == "/api/jobs":
-                    return self.send_json({"jobs": jobs.listing(self.sid())})
+                    return self.send_json({"jobs": jobs.listing(self.owner())})
                 if path.startswith("/api/search/"):
                     rec = searches.get(path.rsplit("/", 1)[-1])
                     return self.send_json({k: v for k, v in rec.items()} if rec else {"error": "Unknown search"}, 200 if rec else 404)
@@ -566,48 +713,89 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/search":
                 if not url.startswith(("https://", "http://")):
                     raise ValueError("Enter a link that starts with http:// or https://")
-                rec = {"status": "running", "message": "Starting", "percent": 5, "error": "", "result": None}
+                check_url(url)
+                rec = {"status": "running", "message": "Starting", "percent": 5, "error": "", "fix": "", "result": None}
                 sid = uuid.uuid4().hex
                 searches[sid] = rec
                 while len(searches) > 100:          # keep memory bounded
                     searches.pop(next(iter(searches)))
-                threading.Thread(target=run_search, args=(rec, url), daemon=True).start()
+                threading.Thread(target=run_search, args=(rec, url, self.tab()), daemon=True).start()
                 return self.send_json({"id": sid})
             if path == "/api/download":
                 if not url.startswith(("https://", "http://")):
                     raise ValueError("Search for a valid link first.")
-                return self.send_json({"id": jobs.create({**data, "url": url}, self.sid())})
+                check_url(url)
+                return self.send_json({"id": jobs.create({**data, "url": url}, self.owner())})
             if path.startswith("/api/cancel/"):
-                ok = jobs.cancel(path.rsplit("/", 1)[-1], self.sid())
+                ok = jobs.cancel(path.rsplit("/", 1)[-1], self.owner())
                 return self.send_json({"cancelled": ok}, 200 if ok else 409)
             if path == "/api/settings":
-                b = str(data.get("browser", SETTINGS["browser"])).lower()
-                if b and b not in BROWSERS:
-                    raise ValueError("Unsupported browser.")
-                SETTINGS["browser"] = b
-                if data.get("clear_cookies") and os.path.isfile(COOKIE_FILE):
-                    os.remove(COOKIE_FILE)
-                    SETTINGS["cookies"] = False
+                tab = self.tab()
+                if not tab:
+                    raise ValueError("Reload the page and try again.")
+                st = touch(tab)
+                if "browser" in data:
+                    br = str(data["browser"]).lower()
+                    if br and br not in BROWSERS:
+                        raise ValueError("Unsupported browser.")
+                    if br and (PUBLIC or not self.is_local()):
+                        raise PermissionError("Reading a browser login only works on the computer running this app. Use a cookies.txt file instead.")
+                    st["browser"] = br
+                if data.get("clear_cookies"):
+                    try:
+                        os.remove(cookie_path(tab))
+                    except OSError:
+                        pass
+                    st.update(cookies=False, domains=[], count=0)
+                    if st["method"] == "file":
+                        st["method"] = "none"
                 txt = data.get("cookies_text")
                 if txt:
-                    if "\t" not in str(txt):
-                        raise ValueError("That doesn't look like a cookies.txt file (Netscape format).")
+                    if PUBLIC and not APP_PASSWORD:
+                        raise PermissionError("Cookie upload stays off until the server owner sets an APP_PASSWORD.")
+                    n, top = parse_cookies(str(txt))
                     os.makedirs(WORK, exist_ok=True)
-                    fd = os.open(COOKIE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    fd = os.open(cookie_path(tab), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                         f.write(str(txt))
-                    SETTINGS["cookies"] = True
-                return self.send_json(dict(SETTINGS))
+                    st.update(cookies=True, domains=top, count=n, method="file")
+                m = data.get("method")
+                if m in ("none", "browser", "file"):
+                    if m == "browser" and not st["browser"]:
+                        raise ValueError("Choose a browser first.")
+                    if m == "file" and not st["cookies"]:
+                        raise ValueError("Upload a cookies.txt file first.")
+                    st["method"] = m
+                elif "browser" in data:
+                    st["method"] = "browser" if st["browser"] else ("none" if st["method"] == "browser" else st["method"])
+                return self.send_json(public_state(tab))
+            if path == "/api/login/test":
+                br = (SESS.get(self.tab()) or {}).get("browser")
+                if not br:
+                    raise ValueError("Choose a browser first.")
+                try:
+                    n, top = test_browser_login(br)
+                except BaseException as e:
+                    return self.send_json({"ok": False, "error": friendly(e)[0]})
+                return self.send_json({"ok": True, "count": n, "domains": top})
+            if path == "/api/session/leave":      # tab closed or reloading: wipe unless it comes back within seconds
+                st = SESS.get(self.tab())
+                if st:
+                    st["close_at"] = time.time() + 12
+                return self.send_json({"ok": True})
+            if path == "/api/session/end":        # hard refresh: wipe the previous session right now
+                wipe_tab(self.tab())
+                return self.send_json({"ok": True})
             if path.startswith("/api/stop/"):
-                ok = jobs.stop(path.rsplit("/", 1)[-1], self.sid())
+                ok = jobs.stop(path.rsplit("/", 1)[-1], self.owner())
                 return self.send_json({"stopped": ok}, 200 if ok else 409)
             if path == "/api/update":
-                r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"], capture_output=True, text=True, timeout=300)
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--disable-pip-version-check", "yt-dlp[default]"], capture_output=True, text=True, timeout=300)
                 if r.returncode:
                     raise RuntimeError(clean_error(r.stderr or r.stdout))
                 return self.send_json({"ok": True, "output": clean_error(r.stdout)})
             if path == "/api/clear":
-                jobs.clear(self.sid())
+                jobs.clear(self.owner())
                 return self.send_json({"ok": True})
             self.send_json({"error": "Not found"}, 404)
         except (ConnectionError, TimeoutError):
@@ -654,6 +842,7 @@ def main():
         ALLOWED_HOSTS.update(extra)
     shutil.rmtree(WORK, ignore_errors=True)
     threading.Thread(target=check_latest, daemon=True).start()
+    threading.Thread(target=reaper, daemon=True).start()
     print(f"Stypzy Video running at http://127.0.0.1:{port}  (FFmpeg: {'yes' if FFMPEG else 'no'}, aria2c: {'yes' if ARIA2 else 'no'})", flush=True)
     if LAN:
         print(f"\nNETWORK MODE: other devices on your Wi-Fi/LAN can open  http://{lan_ip or '<this-pc-ip>'}:{port}", flush=True)

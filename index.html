@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="tok" content="{{TOKEN}}">
+<meta name="fresh" content="{{FRESH}}">
 <title>Stypzy Video</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g'><stop stop-color='%238b5cf6'/><stop offset='1' stop-color='%2322d3ee'/></linearGradient></defs><rect width='32' height='32' rx='9' fill='url(%23g)'/><path d='M12 9l12 7-12 7z' fill='white'/></svg>">
 <style>
@@ -95,6 +96,22 @@ button.pill{cursor:pointer;font:inherit;font-size:12.5px}button.pill:hover{borde
 .sr{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}
 label.btn:focus-within,.sr:focus-visible+*{outline:2px solid var(--c)}
 label.btn{display:inline-block}
+.now{display:flex;gap:10px;align-items:center;padding:12px 14px;border-radius:14px;background:#00000030;border:1px solid var(--line);margin-bottom:6px;font-size:14px}
+.now i{width:9px;height:9px;border-radius:50%;background:var(--mute);flex:none}.now.on i{background:var(--ok);box-shadow:0 0 10px var(--ok)}
+.sh{margin:22px 0 10px;font-size:13px;color:var(--mute);font-weight:700;letter-spacing:.01em}
+.mo{border:1px solid var(--line);border-radius:16px;background:var(--glass);margin-bottom:10px;transition:border-color .15s,background .15s}
+.mo[aria-checked=true]{border-color:var(--c);background:linear-gradient(110deg,#8b5cf622,#22d3ee12)}
+.mo.off .opt{opacity:.5;cursor:not-allowed}
+.opt{display:flex;gap:12px;padding:14px;cursor:pointer;align-items:flex-start;outline-offset:-2px}.opt b{display:block;font-size:14.5px}.opt .d{display:block;color:var(--mute);font-size:13px;margin-top:2px}
+.rd{width:18px;height:18px;border-radius:50%;border:2px solid var(--mute);flex:none;margin-top:2px;display:grid;place-items:center}
+.mo[aria-checked=true] .rd{border-color:var(--c)}.mo[aria-checked=true] .rd::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--c)}
+.sub{padding:0 14px 14px 44px}.sub .mute{margin:0 0 8px}
+.note{margin-top:10px;padding:10px 12px;border-radius:12px;font-size:13px;line-height:1.45;background:#9a9cc01a;color:var(--mute)}
+.note.warn{background:#fbbf2418;color:var(--warn)}.note.ok{background:#4ade8018;color:var(--ok)}.note.bad{background:#fb71851c;color:var(--bad)}
+.how{margin:10px 0 0;padding-left:18px;font-size:13px;color:var(--mute);line-height:1.6}
+.sub details summary{cursor:pointer;color:var(--c);font-size:13px;margin-top:12px}
+.priv{margin:4px 0 0;font-size:12.5px;color:var(--mute)}
+.banner .btn{margin-left:10px}
 .dd{position:relative;display:inline-block}
 .ddb{display:flex;align-items:center;gap:10px;background:#00000050;border:1px solid var(--line);border-radius:12px;padding:9px 14px;cursor:pointer;font-weight:600;transition:border-color .15s,box-shadow .15s}
 .ddb::after{content:"";width:7px;height:7px;border:solid var(--mute);border-width:0 2px 2px 0;transform:rotate(45deg) translateY(-2px);transition:transform .2s}
@@ -144,32 +161,47 @@ label.btn{display:inline-block}
 <div class="pills"><span class="pill" id="pFf">Checking FFmpeg</span><span class="pill" id="pYt">yt-dlp</span><button class="pill" id="pSet" type="button" aria-expanded="false">Login and updates</button></div></nav>
 <h1>Any video. Or just the audio.</h1>
 <p class="lead">Paste a link, pick a quality, and the file lands in your browser's Downloads like any other. Convert to MP3 when you only want the sound.</p>
+<div class="banner hidden" id="fixBar"><span id="fixMsg"></span><button class="btn soft sm" id="fixBtn" type="button">Open settings</button></div>
 <div class="banner hidden" id="offline">Lost connection to the app. Make sure server.py is still running, then reload.</div>
 
 <div class="scrim" id="scrim"></div>
 <aside class="drawer" id="settings" role="dialog" aria-modal="true" aria-label="Login and updates">
-  <div class="dhead"><div><h2>Login and updates</h2><p class="mute">Optional. Public videos work without any of this.</p></div><button class="x" id="sClose" type="button" aria-label="Close">&times;</button></div>
+  <div class="dhead"><div><h2>Login and updates</h2><p class="mute">Optional. Public videos need none of this.</p></div><button class="x" id="sClose" type="button" aria-label="Close">&times;</button></div>
+  <div class="now" id="now"></div>
 
-  <section class="sec">
-    <div class="shead"><span class="ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg></span><h3>Use my browser login</h3><span class="chip2" id="bChip">Off</span></div>
-    <p class="mute">For members-only, age-restricted or login-only videos that your own account can already watch.</p>
-    <select id="browser"><option value="">Not using a login</option><option value="chrome">Chrome</option><option value="edge">Edge</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="opera">Opera</option><option value="chromium">Chromium</option></select>
-    <p class="hint">If Chrome or Edge fails, close that browser completely and try again.</p>
-  </section>
+  <h3 class="sh">1. How should the app sign in to sites?</h3>
+  <div id="meth">
+    <div class="mo" data-m="none" role="radio" aria-checked="true"><div class="opt" tabindex="0"><span class="rd"></span><div><b>No login</b><span class="d">Public videos only. This is the default.</span></div></div></div>
 
-  <section class="sec">
-    <div class="shead"><span class="ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></span><h3>Upload cookies.txt</h3><span class="chip2" id="cChip">None</span></div>
-    <p class="mute" id="cState">No cookies file loaded.</p>
-    <div class="acts"><label class="btn soft sm" for="cfile">Choose file</label><input class="sr" type="file" id="cfile" accept=".txt,text/plain"><button class="btn bad sm" id="cclear" type="button">Remove cookies</button></div>
-    <p class="hint">Kept in a temporary folder and deleted when the app closes. Never saved to your project.</p>
-  </section>
+    <div class="mo" data-m="browser" role="radio" aria-checked="false"><div class="opt" tabindex="0"><span class="rd"></span><div><b>Use a browser I'm signed in to</b><span class="d" id="bWhy">Reads that browser's saved login on this computer.</span></div></div>
+      <div class="sub hidden">
+        <p class="mute" id="detect"></p>
+        <select id="browser" autocomplete="off"><option value="">Choose a browser</option><option value="chrome">Chrome</option><option value="edge">Edge</option><option value="firefox">Firefox</option><option value="brave">Brave</option><option value="opera">Opera</option><option value="chromium">Chromium</option></select>
+        <div class="note warn hidden" id="lockNote"></div>
+        <div class="acts" style="margin-top:12px"><button class="btn soft sm" id="tBtn" type="button">Test this login</button></div>
+        <div class="note hidden" id="tRes"></div>
+      </div></div>
 
+    <div class="mo" data-m="file" role="radio" aria-checked="false"><div class="opt" tabindex="0"><span class="rd"></span><div><b>Upload a cookies.txt file</b><span class="d" id="cWhy">Most reliable for Chrome, Edge and Brave logins.</span></div></div>
+      <div class="sub hidden">
+        <p class="mute" id="cState">No file loaded.</p>
+        <div class="acts"><label class="btn soft sm" for="cfile">Choose cookies.txt</label><input class="sr" type="file" id="cfile" accept=".txt,text/plain"><button class="btn bad sm" id="cclear" type="button">Remove</button></div>
+        <details><summary>How do I get a cookies.txt file?</summary><ol class="how">
+          <li>Sign in to the site (for example instagram.com) in your normal browser.</li>
+          <li>Install a cookies exporter extension, such as "Get cookies.txt LOCALLY".</li>
+          <li>Open the site, click the extension and choose Export.</li>
+          <li>Come back here and choose the saved file. Treat it like a password and delete it afterwards.</li></ol></details>
+      </div></div>
+  </div>
+
+  <h3 class="sh">2. Keep yt-dlp current</h3>
   <section class="sec">
-    <div class="shead"><span class="ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg></span><h3>Keep yt-dlp current</h3><span class="chip2" id="vChip">Checking</span></div>
+    <div class="shead"><span class="ico"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg></span><h3>yt-dlp</h3><span class="chip2" id="vChip">Checking</span></div>
     <p class="mute" id="vState">Checking version.</p>
-    <div class="acts"><button class="btn go sm" id="upd" type="button">Update yt-dlp</button></div>
-    <p class="hint" id="uMsg">After updating, stop and start server.py once.</p>
+    <div class="acts" style="margin-top:12px"><button class="btn go sm" id="upd" type="button">Update yt-dlp</button></div>
+    <p class="hint" id="uMsg"></p>
   </section>
+  <p class="priv">Your login choice, cookies and finished files are cleared when you close this tab or hard-refresh with Ctrl+Shift+R.</p>
 </aside>
 <div class="glass search"><input id="url" type="url" placeholder="Paste a video or playlist link" aria-label="Video link" autofocus>
 <button class="btn soft" id="paste" type="button">Paste</button><button class="btn go" id="find" type="button">Find formats</button></div>
@@ -199,38 +231,76 @@ label.btn{display:inline-block}
 </main>
 <div id="toasts" role="status" aria-live="polite"></div>
 <script>
-const $=s=>$d.querySelector(s),$d=document,TOK=$('meta[name=tok]').content;
-const S={info:{},res:null,tab:"video",height:null,vf:-1,af:-1},saved=new Set();let timer=null,fails=0;
-async function api(p,d){const r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":TOK},body:d?JSON.stringify(d):undefined});
-let v={};try{v=await r.json()}catch{}if(!r.ok)throw Error(v.error||"Request failed");return v}
+const $=s=>$d.querySelector(s),$d=document,TOK=$('meta[name=tok]').content,FRESH=$('meta[name=fresh]').content==="1";
+const rid=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),b=>b.toString(16).padStart(2,"0")).join("");
+let TAB=sessionStorage.getItem("tab");
+const beacon=(p,t)=>fetch(p,{method:"POST",keepalive:true,headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":t},body:"{}"}).catch(()=>{});
+if(FRESH&&TAB){beacon("/api/session/end",TAB);TAB=null}   /* Ctrl+Shift+R: wipe the previous session */
+if(!TAB){TAB=rid();sessionStorage.setItem("tab",TAB)}
+addEventListener("pagehide",e=>{if(!e.persisted)beacon("/api/session/leave",TAB)});   /* tab closed (a quick reload comes back and cancels this) */
+addEventListener("pageshow",e=>{if(e.persisted)location.reload()});
+const S={info:{},res:null,tab:"video",height:null,vf:-1,af:-1},saved=new Set(),ACTIVE=new Set();let timer=null,fails=0;
+async function api(p,d){const r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":TAB},body:d?JSON.stringify(d):undefined});
+let v={};try{v=await r.json()}catch{}if(!r.ok){const e=Error(v.error||"Request failed");e.fix=v.fix;throw e}return v}
 const el=(t,c,x)=>{const e=$d.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 const toast=(m,bad)=>{const t=el("div","toast"+(bad?" bad":""),m);$("#toasts").append(t);setTimeout(()=>t.remove(),bad?6000:3500)};
 const fB=v=>{if(!v)return"Unknown";for(const u of["B","KB","MB","GB"]){if(v<1024)return v.toFixed(v<10?1:0)+" "+u;v/=1024}return v.toFixed(1)+" TB"};
 const fT=s=>{s=Math.round(s);const h=s/3600|0,m=s%3600/60|0,x=s%60;return h?`${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`:`${m}:${String(x).padStart(2,"0")}`};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-function paintInfo(){const i=S.info;
+const CHROMIUM=["chrome","edge","brave","opera","chromium"],BN={chrome:"Chrome",edge:"Edge",firefox:"Firefox",brave:"Brave",opera:"Opera",chromium:"Chromium"};
+const WIN=/Windows/.test(navigator.userAgent);let ME="",pick="none";
+async function detectMe(){try{if(navigator.brave&&await navigator.brave.isBrave())return"brave"}catch{}
+  const u=navigator.userAgent;return/Edg\//.test(u)?"edge":/OPR\//.test(u)?"opera":/Firefox\//.test(u)?"firefox":/Chrome\//.test(u)?"chrome":""}
+function note(id,t,c){const n=$(id);n.className="note "+(c||"")+(t?"":" hidden");n.textContent=t||""}
+function lockText(b){
+  if(!CHROMIUM.includes(b)||!WIN)return"";
+  return b===ME?`${BN[b]} is the browser showing this page, so it is open right now and Windows keeps its saved logins locked. Test will most likely fail. Choose Firefox, upload a cookies.txt file, or open this page in another browser and fully close ${BN[b]}.`
+   :`Fully close ${BN[b]} first, including its icon in the system tray, or Windows keeps its saved logins locked. Newer ${BN[b]} versions also encrypt cookies in a way that can still block this. If Test fails, use Firefox or a cookies.txt file.`}
+function paintInfo(){
+  const i=S.info,pub=i.public,m=i.method;
   $("#pFf").textContent=i.ffmpeg?"FFmpeg ready":"FFmpeg not found";$("#pFf").className="pill "+(i.ffmpeg?"ok":"warn");
   $("#pYt").textContent=i.update?`yt-dlp ${i.ytdlp} - update available`:"yt-dlp "+i.ytdlp;$("#pYt").className="pill "+(i.update?"up":"ok");
-  $("#vState").textContent=i.update?`You have ${i.ytdlp}. ${i.latest} is available. Updating fixes most sites that stopped working.`:`You have ${i.ytdlp}${i.latest?", the latest version":""}.`;
-  $("#cState").textContent=i.cookies?"A cookies file is loaded and in use.":"No cookies file loaded.";$("#cclear").disabled=!i.cookies;
+  const who=m==="browser"?`Signed in through your ${BN[i.browser]} login`:m==="file"?`Signed in with cookies.txt (${i.count} cookies)`:"No login. Public videos only";
+  $("#now").className="now"+(m!=="none"?" on":"");$("#now").replaceChildren(el("i"),el("span",0,who));
+  $d.querySelectorAll(".mo").forEach(o=>{const k=o.dataset.m,on=k===pick;o.setAttribute("aria-checked",on);const sub=o.querySelector(".sub");if(sub)sub.classList.toggle("hidden",!on)});
+  $(".mo[data-m=browser]").classList.toggle("off",!i.can_browser);$(".mo[data-m=file]").classList.toggle("off",!i.can_cookies);
+  $("#bWhy").textContent=i.can_browser?"Reads that browser's saved login on this computer.":pub?"Not available on a hosted server, because it cannot see your browser. Use a cookies.txt file.":"Only works on the computer that runs the app. Use a cookies.txt file.";
+  $("#cWhy").textContent=i.can_cookies?"Most reliable for Chrome, Edge and Brave logins.":"Turned off until the server owner sets an APP_PASSWORD.";
+  $("#detect").textContent=ME?`This page is open in ${BN[ME]}.`:"";
+  const sel=$("#browser");if(sel.value!==i.browser){sel.value=i.browser;sel.dispatchEvent(new Event("sync"))}
+  note("#lockNote",lockText(sel.value),"warn");
+  $("#cState").textContent=i.cookies?`${i.count} cookies loaded (${i.domains.join(", ")}).`:"No file loaded.";$("#cclear").disabled=!i.cookies;
   const chip=(id,t,c)=>{$(id).textContent=t;$(id).className="chip2 "+(c||"")};
-  chip("#bChip",i.browser?"On: "+i.browser[0].toUpperCase()+i.browser.slice(1):"Off",i.browser?"on":"");
-  chip("#cChip",i.cookies?"Loaded":"None",i.cookies?"on":"");
   chip("#vChip",i.update?"Update ready":"Up to date",i.update?"up":"on");
-  const b=$("#browser");if(b.value!==i.browser){b.value=i.browser;b.dispatchEvent(new Event("sync"))}}
-async function init(){S.info=await api("/api/info");paintInfo();poll()}
+  $("#vState").textContent=pub?`Version ${i.ytdlp}. On a hosted server, yt-dlp updates when the app is redeployed.`:i.update?`You have ${i.ytdlp}. ${i.latest} is available. Updating fixes most sites that stopped working.`:`You have ${i.ytdlp}${i.latest?", the latest version":""}.`;
+  $("#upd").classList.toggle("hidden",pub);$("#uMsg").textContent=pub?"":"After updating, stop and start server.py once to use the new version."}
+async function init(){S.info=await api("/api/info");ME=await detectMe();pick=S.info.method;paintInfo();poll();
+  setTimeout(()=>api("/api/ping").catch(()=>{}),3000);setInterval(()=>api("/api/ping").catch(()=>{}),60000)}
 function openSet(o){$("#settings").classList.toggle("open",o);$("#scrim").classList.toggle("open",o);$d.body.classList.toggle("lock",o);$("#pSet").setAttribute("aria-expanded",o);if(o)$("#sClose").focus()}
 $("#pSet").onclick=()=>openSet(true);$("#sClose").onclick=()=>openSet(false);$("#scrim").onclick=()=>openSet(false);
-$("#pYt").onclick=()=>{if(S.info.update)openSet(true)};
+$("#pYt").onclick=()=>{if(S.info.update)openSet(true)};$("#fixBtn").onclick=()=>openSet(true);
 $d.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#settings").classList.contains("open"))openSet(false)});
-async function saveSettings(p,msg){try{Object.assign(S.info,await api("/api/settings",p));paintInfo();toast(msg||"Saved")}catch(e){toast(e.message,1)}}
-$("#browser").onchange=()=>saveSettings({browser:$("#browser").value},$("#browser").value?"Using your browser login":"Login turned off");
-$("#cfile").onchange=async e=>{const f=e.target.files[0];if(!f)return;if(f.size>2e6)return toast("That file is too large.",1);
-  await saveSettings({cookies_text:await f.text()},"Cookies loaded");e.target.value=""};
+async function saveSettings(p,msg){try{Object.assign(S.info,await api("/api/settings",p));paintInfo();if(msg)toast(msg)}catch(e){toast(e.message,1);paintInfo()}}
+$d.querySelectorAll(".mo .opt").forEach(o=>{const k=o.parentElement.dataset.m;
+  const go=async()=>{
+    if(k==="browser"&&!S.info.can_browser)return toast("Browser login only works on the computer running the app.",1);
+    if(k==="file"&&!S.info.can_cookies)return toast("Cookie upload is turned off on this server.",1);
+    pick=k;note("#tRes","");
+    if(k==="none")await saveSettings({method:"none"},"Login turned off");
+    else if(k==="browser"){const sel=$("#browser");if(!sel.value){sel.value=ME||"firefox";sel.dispatchEvent(new Event("sync"))}await saveSettings({method:"browser",browser:sel.value},BN[sel.value]+" selected. Press Test to check it.")}
+    else if(S.info.cookies)await saveSettings({method:"file"},"Using your cookies.txt");else paintInfo()};
+  o.onclick=go;o.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();go()}}});
+$("#browser").onchange=()=>{note("#tRes","");pick="browser";saveSettings({browser:$("#browser").value})};
+$("#tBtn").onclick=async()=>{const b=$("#tBtn");if(!$("#browser").value)return note("#tRes","Choose a browser first.","bad");
+  b.disabled=true;b.textContent="Testing...";note("#tRes","Reading that browser's saved logins...");
+  try{const r=await api("/api/login/test",{});note("#tRes",r.ok?`It works. Found ${r.count} saved cookies (${r.domains.join(", ")}). Now paste your link.`:r.error,r.ok?"ok":"bad")}
+  catch(e){note("#tRes",e.message,"bad")}finally{b.disabled=false;b.textContent="Test this login"}};
+$("#cfile").onchange=async e=>{const f=e.target.files[0];if(!f)return;if(f.size>1.5e6)return toast("That file is too large.",1);
+  pick="file";await saveSettings({cookies_text:await f.text()},"Cookies loaded");e.target.value=""};
 $("#cclear").onclick=()=>saveSettings({clear_cookies:true},"Cookies removed");
 $("#upd").onclick=async()=>{const b=$("#upd");b.disabled=true;b.textContent="Updating...";$("#uMsg").textContent="";
-  try{await api("/api/update",{});$("#uMsg").textContent="Updated. Stop and start server.py again to use the new version.";$("#vChip").textContent="Restart needed";toast("yt-dlp updated. Restart server.py.")}
+  try{await api("/api/update",{});$("#uMsg").textContent="Updated. Stop server.py (close its window or press Stop in PyCharm) and run it again.";$("#vChip").textContent="Restart needed";toast("yt-dlp updated. Restart server.py.")}
   catch(e){toast(e.message,1)}finally{b.disabled=false;b.textContent="Update yt-dlp"}};
 $("#paste").onclick=async()=>{try{$("#url").value=(await navigator.clipboard.readText()).trim();find()}catch{toast("Allow clipboard access, or paste with Ctrl+V.",1)}};
 $("#find").onclick=find;$("#url").onkeydown=e=>{if(e.key==="Enter")find()};
@@ -239,14 +309,15 @@ function showStatus(p,m){$("#sFill").style.width=p+"%";$("#sPct").textContent=Ma
 $d.querySelectorAll(".step").forEach(s=>s.classList.toggle("on",p>=+s.dataset.at))}
 async function find(){
   const url=$("#url").value.trim();if(!url)return;
-  $("#find").disabled=true;$("#result").classList.add("hidden");$("#status").classList.remove("hidden");showStatus(5,"Starting");
+  $("#find").disabled=true;$("#result").classList.add("hidden");$("#fixBar").classList.add("hidden");$("#status").classList.remove("hidden");showStatus(5,"Starting");
   try{
     const {id}=await api("/api/search",{url});
     for(;;){await sleep(350);const r=await api("/api/search/"+id);
-      if(r.status==="error")throw Error(r.error);showStatus(r.percent||5,r.message);
+      if(r.status==="error"){const er=Error(r.error);er.fix=r.fix;throw er}showStatus(r.percent||5,r.message);
       if(r.status==="done"){S.res={...r.result,url};break}}
     await sleep(350);$("#status").classList.add("hidden");render();
-  }catch(e){showStatus(0,"Search failed");$("#status").classList.add("hidden");toast(e.message,1)}
+  }catch(e){showStatus(0,"Search failed");$("#status").classList.add("hidden");toast(e.message,1);
+    if(e.fix){$("#fixMsg").textContent=e.message;$("#fixBtn").textContent=e.fix==="update"?"Open updates":"Open login settings";$("#fixBar").classList.remove("hidden")}}
   finally{$("#find").disabled=false}
 }
 function row(cells,pick){const tr=el("tr");tr.tabIndex=0;tr.setAttribute("aria-selected","false");
@@ -298,7 +369,7 @@ $("#queue").onclick=async()=>{
   if(r.type==="playlist")$d.querySelectorAll("#plist input:checked").forEach(cb=>{const e=r.entries[+cb.dataset.i];list.push({...base,url:e.url,title:e.title,height:S.height,label})});
   else{const f=a?(S.af>=0?r.audio_formats[S.af]:null):(S.vf>=0?r.formats[S.vf]:null);
     list.push({...base,url:r.url,title:r.title,thumb:r.thumb,height:S.height,label,fmt:f?{id:f.id,audio:!!f.audio}:null})}
-  try{for(const j of list)await api("/api/download",j);toast(list.length>1?`${list.length} downloads started`:"Download started");poll()}catch(e){toast(e.message,1)}
+  try{for(const j of list){const r=await api("/api/download",j);ACTIVE.add(r.id)}toast(list.length>1?`${list.length} downloads started`:"Download started");poll()}catch(e){toast(e.message,1)}
 };
 $("#clear").onclick=async()=>{await api("/api/clear",{});poll()};
 
@@ -318,10 +389,11 @@ function card(j){
   st.append(el("span",0,j.message));b.append(t,m,st);
   if(j.error)b.append(el("div","err",j.error));
   const a=el("div","acts");
+  if(j.fix){const x=el("button","btn soft sm",j.fix==="update"?"Open updates":"Open login settings");x.onclick=()=>openSet(true);a.append(x)}
   if(j.live&&j.status==="downloading"){const x=el("button","btn go sm","Stop and save");x.onclick=()=>api("/api/stop/"+j.id,{}).then(poll).catch(e=>toast(e.message,1));a.append(x)}
   if(["queued","downloading","processing"].includes(j.status)){const x=el("button","btn bad sm","Cancel");x.onclick=()=>api("/api/cancel/"+j.id,{}).then(poll).catch(e=>toast(e.message,1));a.append(x)}
   if(j.status==="completed")j.files.forEach(f=>{const x=el("button","btn go sm","Save "+fB(f.size));x.title=f.name;x.onclick=()=>save(f);a.append(x);
-    if(!saved.has(f.url)){saved.add(f.url);setTimeout(()=>save(f),400*saved.size%2000)}});
+    if(ACTIVE.has(j.id)&&!saved.has(f.url)){saved.add(f.url);setTimeout(()=>save(f),400*saved.size%2000)}});
   c.append(ring(j.percent,txt),b,a);return c}
 async function poll(){
   clearTimeout(timer);
