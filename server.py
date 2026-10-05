@@ -70,8 +70,11 @@ MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE", "2")) if PUBLIC else 99       # ac
 if PUBLIC:
     SLOTS = threading.Semaphore(int(os.environ.get("MAX_JOBS", "1")))       # free instances are tiny: 1 at a time
     TTL = 900
+    if not APP_PASSWORD and not os.environ.get("OPEN_ACCESS"):
+        fatal("Set the APP_PASSWORD environment variable before running on a public server.\n"
+              "(To run with no password at all, set OPEN_ACCESS=1 instead. Anyone with the link can then use it.)")
     if not APP_PASSWORD:
-        fatal("Set the APP_PASSWORD environment variable before running on a public server.")
+        print("WARNING: OPEN_ACCESS is on. Anyone with the link can use this server.", flush=True)
 AUTH_COOKIE = hmac.new(APP_PASSWORD.encode(), b"stypzy-auth", hashlib.sha256).hexdigest() if APP_PASSWORD else ""
 FAILS = {}   # ip -> (failed logins, first failure time)
 
