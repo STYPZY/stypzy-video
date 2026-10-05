@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: stypzy-video
-    runtime: docker
-    plan: free
-    healthCheckPath: /healthz
-    envVars:
-      - key: APP_PASSWORD
-        sync: false      # you type this in the Render dashboard; it is never stored in the repo

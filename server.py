@@ -49,6 +49,19 @@ FFMPEG = shutil.which("ffmpeg") or (
     os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe") if os.name == "nt" else None)
 if FFMPEG and not os.path.isfile(FFMPEG):
     FFMPEG = None
+if not FFMPEG:
+    # No system ffmpeg (e.g. on Render): use the copy that pip installs with imageio-ffmpeg.
+    try:
+        import imageio_ffmpeg
+        _exe = imageio_ffmpeg.get_ffmpeg_exe()
+        _bin = os.path.join(tempfile.gettempdir(), "stypzy-bin")
+        os.makedirs(_bin, exist_ok=True)
+        FFMPEG = os.path.join(_bin, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")   # yt-dlp looks for this exact name
+        if not os.path.exists(FFMPEG):
+            shutil.copy2(_exe, FFMPEG)
+        os.chmod(FFMPEG, 0o755)
+    except Exception:
+        FFMPEG = None
 ARIA2 = None if os.environ.get("STYPZY_NO_ARIA") else (shutil.which("aria2c") or (
     os.path.join(os.path.dirname(sys.executable), "aria2c.exe") if os.name == "nt" else None))
 if ARIA2 and not os.path.isfile(ARIA2):
@@ -70,11 +83,8 @@ MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE", "2")) if PUBLIC else 99       # ac
 if PUBLIC:
     SLOTS = threading.Semaphore(int(os.environ.get("MAX_JOBS", "1")))       # free instances are tiny: 1 at a time
     TTL = 900
-    if not APP_PASSWORD and not os.environ.get("OPEN_ACCESS"):
-        fatal("Set the APP_PASSWORD environment variable before running on a public server.\n"
-              "(To run with no password at all, set OPEN_ACCESS=1 instead. Anyone with the link can then use it.)")
     if not APP_PASSWORD:
-        print("WARNING: OPEN_ACCESS is on. Anyone with the link can use this server.", flush=True)
+        print("NOTE: no APP_PASSWORD set, so anyone with the link can use this server.", flush=True)
 AUTH_COOKIE = hmac.new(APP_PASSWORD.encode(), b"stypzy-auth", hashlib.sha256).hexdigest() if APP_PASSWORD else ""
 FAILS = {}   # ip -> (failed logins, first failure time)
 
