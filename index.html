@@ -134,12 +134,12 @@ label.btn{display:inline-block}
 .ring svg{transform:rotate(-90deg)}.ring circle{fill:none;stroke-width:6;stroke-linecap:round}
 .ring .bg{stroke:#ffffff14}.ring .fg{stroke:var(--c);transition:stroke-dashoffset .5s;filter:drop-shadow(0 0 5px var(--c))}
 .ring span{position:absolute;inset:0;display:grid;place-items:center;font-size:13px;font-weight:750}
-[data-s=processing] .fg{stroke:var(--warn)}[data-s=completed] .fg{stroke:var(--ok)}[data-s=error] .fg{stroke:var(--bad)}
+[data-s=processing] .fg{stroke:var(--warn)}[data-s=ready] .fg{stroke:var(--warn)}[data-s=completed] .fg{stroke:var(--ok)}[data-s=error] .fg{stroke:var(--bad)}
 [data-s=queued] .ring svg,[data-s=downloading].ind .ring svg,[data-s=processing] .ring svg{animation:spin 1.4s linear infinite}
 @keyframes spin{to{transform:rotate(270deg)}}
 .jb{flex:1;min-width:0}.jt{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 11px;border-radius:99px;margin-right:8px;background:#9a9cc02a;color:var(--mute)}
-[data-s=downloading] .badge{background:#22d3ee22;color:var(--c)}[data-s=processing] .badge{background:#fbbf2422;color:var(--warn)}
+[data-s=downloading] .badge,[data-s=sending] .badge{background:#22d3ee22;color:var(--c)}[data-s=processing] .badge,[data-s=ready] .badge{background:#fbbf2422;color:var(--warn)}
 [data-s=completed] .badge{background:#4ade8022;color:var(--ok)}[data-s=error] .badge{background:#fb718522;color:var(--bad)}
 .stats{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--mute);margin-top:6px}.stats b{color:var(--text)}
 .err{color:var(--bad);font-size:13px;white-space:pre-wrap;margin-top:6px}
@@ -186,6 +186,7 @@ label.btn{display:inline-block}
       <div class="sub hidden">
         <p class="mute" id="cState">No file loaded.</p>
         <div class="acts"><label class="btn soft sm" for="cfile">Choose cookies.txt</label><input class="sr" type="file" id="cfile" accept=".txt,text/plain"><button class="btn bad sm" id="cclear" type="button">Remove</button></div>
+        <p class="hint hidden" id="bridgeHelp">Hosted browser login: install the companion extension from the project's browser-extension folder. Open this app in one tab and the signed-in platform in another, then use the extension from the platform tab. It reads cookies only for that active site and asks before sending them here. Set APP_PASSWORD on Render first.</p>
         <details><summary>How do I get a cookies.txt file?</summary><ol class="how">
           <li>Sign in to the site (for example instagram.com) in your normal browser.</li>
           <li>Install a cookies exporter extension, such as "Get cookies.txt LOCALLY".</li>
@@ -240,7 +241,7 @@ if(FRESH&&TAB)TAB=null;
 if(!TAB){TAB=rid();sessionStorage.setItem("tab",TAB)}
 addEventListener("pagehide",e=>{if(!e.persisted)beacon("/api/session/leave",TAB)});
 addEventListener("pageshow",e=>{if(e.persisted)location.reload()});
-const S={info:{},res:null,tab:"video",height:null,vf:-1,af:-1},saved=new Set(),ACTIVE=new Set();let timer=null,fails=0;
+const S={info:{},res:null,tab:"video",height:null,vf:-1,af:-1},saved=new Set(),ACTIVE=new Set(),PENDING=new Map();let timer=null,fails=0;
 async function api(p,d){await READY;const r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":TAB},body:d?JSON.stringify(d):undefined});
 let v={};try{v=await r.json()}catch{}if(!r.ok){const e=Error(v.error||"Request failed");e.fix=v.fix;throw e}return v}
 const el=(t,c,x)=>{const e=$d.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
@@ -266,8 +267,9 @@ function paintInfo(){
   $("#now").className="now"+(m!=="none"?" on":"");$("#now").replaceChildren(el("i"),el("span",0,who));
   $d.querySelectorAll(".mo").forEach(o=>{const k=o.dataset.m,on=k===pick;o.setAttribute("aria-checked",on);const sub=o.querySelector(".sub");if(sub)sub.classList.toggle("hidden",!on)});
   $(".mo[data-m=browser]").classList.toggle("off",!i.can_browser);$(".mo[data-m=file]").classList.toggle("off",!i.can_cookies);
-  $("#bWhy").textContent=i.can_browser?"Reads that browser's saved login on this computer.":pub?"Not available on a hosted server, because it cannot see your browser. Use a cookies.txt file.":"Only works on the computer that runs the app. Use a cookies.txt file.";
-  $("#cWhy").textContent=i.can_cookies?"Most reliable for Chrome, Edge and Brave logins.":"Turned off until the server owner sets an APP_PASSWORD.";
+  $("#bWhy").textContent=i.can_browser?"Reads that browser's saved login on this computer.":pub?"Render cannot read this computer's browser profile. Import from a signed-in tab with the companion extension, or upload cookies.txt.":"Only works on the computer that runs the app. Use a cookies.txt file.";
+  $("#cWhy").textContent=i.can_cookies?(pub?"Upload cookies.txt or import from the companion browser extension.":"Most reliable for Chrome, Edge and Brave logins."):"Turned off until the server owner sets an APP_PASSWORD.";
+  $("#bridgeHelp").classList.toggle("hidden",!pub);
   $("#detect").textContent=ME?`This page is open in ${BN[ME]}.`:"";
   const sel=$("#browser");if(sel.value!==i.browser){sel.value=i.browser;sel.dispatchEvent(new Event("sync"))}
   note("#lockNote",lockText(sel.value),"warn");
@@ -300,6 +302,15 @@ $("#tBtn").onclick=async()=>{const b=$("#tBtn");if(!$("#browser").value)return n
 $("#cfile").onchange=async e=>{const f=e.target.files[0];if(!f)return;if(f.size>1.5e6)return toast("That file is too large.",1);
   pick="file";await saveSettings({cookies_text:await f.text()},"Cookies loaded");e.target.value=""};
 $("#cclear").onclick=()=>saveSettings({clear_cookies:true},"Cookies removed");
+window.addEventListener("message",async e=>{
+  if(e.source!==window||e.origin!==location.origin)return;
+  const d=e.data;if(!d||d.type!=="STYPZY_BROWSER_COOKIE_IMPORT"||typeof d.text!=="string")return;
+  if(!S.info.can_cookies)return toast("Cookie import is disabled. The server owner must set APP_PASSWORD.",1);
+  if(d.text.length>1_500_000)return toast("The browser returned too much cookie data.",1);
+  const site=String(d.site||"this site").slice(0,180),count=Number(d.count)||0;
+  if(!confirm("Send "+count+" login cookies for "+site+" to this Stypzy server? The server keeps a temporary copy for this page session."))return;
+  pick="file";await saveSettings({cookies_text:d.text},"Browser cookies imported");
+});
 $("#upd").onclick=async()=>{const b=$("#upd");b.disabled=true;b.textContent="Updating...";$("#uMsg").textContent="";
   try{await api("/api/update",{});$("#uMsg").textContent="Updated. Stop server.py (close its window or press Stop in PyCharm) and run it again.";$("#vChip").textContent="Restart needed";toast("yt-dlp updated. Restart server.py.")}
   catch(e){toast(e.message,1)}finally{b.disabled=false;b.textContent="Update yt-dlp"}};
@@ -377,24 +388,31 @@ $("#clear").onclick=async()=>{await api("/api/clear",{});poll()};
 function ring(p,txt){const C=2*Math.PI*26,off=C*(1-(p==null?.28:p/100));
   const w=el("div","ring");w.innerHTML=`<svg width="64" height="64" viewBox="0 0 64 64"><circle class="bg" cx="32" cy="32" r="26"/><circle class="fg" cx="32" cy="32" r="26" stroke-dasharray="${C}" stroke-dashoffset="${off}"/></svg>`;
   w.append(el("span",0,txt));return w}
-const NAMES={queued:"Queued",downloading:"Downloading",processing:"Processing",completed:"Ready",error:"Failed",cancelled:"Cancelled"};
-function save(f){const a=el("a");a.href=f.url;a.download=f.name;$d.body.append(a);a.click();a.remove()}
+const NAMES={queued:"Queued",downloading:"Downloading from site",processing:"Preparing file",ready:"Ready to send",sending:"Sending to browser",completed:"Saved to browser",error:"Failed",cancelled:"Cancelled"};
+function save(f,jid){if(jid)PENDING.set(jid,Date.now());const a=el("a");a.href=f.url;a.download=f.name;$d.body.append(a);a.click();a.remove();if(jid)setTimeout(poll,100)}
 function card(j){
+  if(j.status==="sending"||j.status==="completed")PENDING.delete(j.id);
+  if(j.status==="ready"&&PENDING.has(j.id)&&Date.now()-PENDING.get(j.id)>12000)PENDING.delete(j.id);
   const c=el("article","glass job"+(j.status==="downloading"&&j.percent==null?" ind":""));c.dataset.s=j.status;
   const txt=j.status==="completed"?"100%":j.status==="error"?"!":j.percent!=null&&j.status!=="queued"?Math.round(j.percent)+"%":"...";
   const b=el("div","jb"),t=el("div","jt",j.title);t.title=j.title;
   const m=el("div","mute");if(j.live&&j.status==="downloading")m.append(el("span","live","REC"));m.append(el("span","badge",j.live&&j.status==="downloading"?"Recording":NAMES[j.status]),j.label);
   const st=el("div","stats");
   if(j.speed)st.append(el("span",0,fB(j.speed)+"/s"));
-  if(j.eta!=null&&j.status==="downloading")st.append(el("span",0,fT(j.eta)+" left"));
+  if(j.eta!=null&&["downloading","sending"].includes(j.status))st.append(el("span",0,fT(j.eta)+" left"));
   st.append(el("span",0,j.message));b.append(t,m,st);
   if(j.error)b.append(el("div","err",j.error));
   const a=el("div","acts");
   if(j.fix){const x=el("button","btn soft sm",j.fix==="update"?"Open updates":"Open login settings");x.onclick=()=>openSet(true);a.append(x)}
   if(j.live&&j.status==="downloading"){const x=el("button","btn go sm","Stop and save");x.onclick=()=>api("/api/stop/"+j.id,{}).then(poll).catch(e=>toast(e.message,1));a.append(x)}
   if(["queued","downloading","processing"].includes(j.status)){const x=el("button","btn bad sm","Cancel");x.onclick=()=>api("/api/cancel/"+j.id,{}).then(poll).catch(e=>toast(e.message,1));a.append(x)}
-  if(j.status==="completed")j.files.forEach(f=>{const x=el("button","btn go sm","Save "+fB(f.size));x.title=f.name;x.onclick=()=>save(f);a.append(x);
-    if(ACTIVE.has(j.id)&&!saved.has(f.url)){saved.add(f.url);setTimeout(()=>save(f),400*saved.size%2000)}});
+  if(["ready","completed"].includes(j.status))j.files.forEach(f=>{
+    const auto=j.status==="ready"&&ACTIVE.has(j.id)&&!saved.has(f.url);
+    const x=el("button","btn go sm",j.status==="ready"?"Save "+fB(f.size):"Download again "+fB(f.size));x.title=f.name;
+    x.disabled=j.status==="ready"&&(PENDING.has(j.id)||ACTIVE.has(j.id));x.onclick=()=>save(f,j.id);a.append(x);
+    if(auto){saved.add(f.url);setTimeout(()=>save(f,j.id),400*saved.size%2000)}
+  });
+  if(j.status==="ready")ACTIVE.delete(j.id);
   c.append(ring(j.percent,txt),b,a);return c}
 async function poll(){
   clearTimeout(timer);
@@ -402,8 +420,8 @@ async function poll(){
     const box=$("#jobs");box.replaceChildren();
     if(!jobs.length)box.append(el("div","empty","Nothing here yet. Paste a link above and your downloads will show up here."));
     jobs.forEach(j=>box.append(card(j)));
-    $("#clear").disabled=!jobs.some(j=>["completed","error","cancelled"].includes(j.status));
-    if(jobs.some(j=>["queued","downloading","processing"].includes(j.status)))timer=setTimeout(poll,700);
+    $("#clear").disabled=!jobs.some(j=>["ready","completed","error","cancelled"].includes(j.status));
+    if(jobs.some(j=>["queued","downloading","processing","sending"].includes(j.status)||j.status==="ready"&&(ACTIVE.has(j.id)||PENDING.has(j.id))))timer=setTimeout(poll,700);
   }catch{if(++fails>=5){$("#offline").classList.remove("hidden");return}timer=setTimeout(poll,1500)}
 }
 function dd(sel){

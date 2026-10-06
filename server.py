@@ -1,5 +1,5 @@
 """Stypzy Video v2 - run: python server.py   (needs: python -m pip install -U yt-dlp)
-Files are prepared in a temp folder, then handed to the browser's own download flow."""
+Files are prepared in a temp folder, then streamed to the browser's download flow."""
 import atexit, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote, parse_qs
@@ -69,7 +69,7 @@ ARIA2 = None if os.environ.get("STYPZY_NO_ARIA") else (shutil.which("aria2c") or
     os.path.join(os.path.dirname(sys.executable), "aria2c.exe") if os.name == "nt" else None))
 if ARIA2 and not os.path.isfile(ARIA2):
     ARIA2 = None
-SLOTS, ALLOWED_HOSTS, TERMINAL = threading.Semaphore(2), set(), ("completed", "cancelled", "error")
+SLOTS, ALLOWED_HOSTS, TERMINAL = threading.Semaphore(2), set(), ("ready", "completed", "cancelled", "error")
 TTL = 1800  # seconds a finished file stays available
 BROWSERS = ("chrome", "edge", "firefox", "brave", "opera", "chromium")
 LATEST, SESS, SESS_LOCK = {"v": None}, {}, threading.Lock()   # per-tab login settings
@@ -498,6 +498,7 @@ class Jobs:
                "thumb": thumb if thumb.startswith("http") else "", "label": str(d.get("label") or "")[:60],
                "status": "queued", "percent": 0, "speed": None, "eta": None, "message": "Waiting for a free slot",
                "error": "", "files": [], "created": time.time(), "finished": 0, "stages": 1, "staging": None,
+               "delivery_total": 0, "delivery_sent": 0, "delivery_by_file": {}, "delivery_done": set(), "delivery_active": set(),
                "cancel": threading.Event(), "stop": threading.Event(), "purged": False, "live": d.get("mode") == "live", "data": d, "owner": owner, "tab": tab, "fix": ""}
         with SESS_LOCK:
             if tab in ENDED_TABS:
@@ -528,7 +529,7 @@ class Jobs:
         with self.lock:
             for k in [k for k, j in self.items.items() if j["status"] in TERMINAL and time.time() - j["finished"] > TTL]:
                 self.drop(k)
-            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab")},
+            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab", "delivery_by_file", "delivery_done", "delivery_active")},
                      "files": [{"name": n, "size": s, "url": f"/file/{j['id']}/{j['dl']}/{i}?tab={quote(j['tab'])}"} for i, (n, s) in enumerate(j["files"])]}
                     for j in sorted(self.items.values(), key=lambda j: -j["created"]) if owner is None or j["owner"] == owner]
 
@@ -539,6 +540,8 @@ class Jobs:
             job.update(status=status, message=message, speed=None, eta=None, finished=time.time(), **extra)
             if status == "completed":
                 job["percent"] = 100
+            elif status == "ready":
+                job["percent"] = 50
 
     def cancel(self, key, owner=None):
         with self.lock:
@@ -595,14 +598,16 @@ class Jobs:
                         total = s.get("total_bytes") or s.get("total_bytes_estimate")
                         done = s.get("downloaded_bytes") or 0
                         n = job["stages"]
-                        job["percent"] = round(min(99.9, 100 * (min(st["stage"], n - 1) + min(1, done / total)) / n), 1) if total else None
+                        # The first half represents fetching/preparing on the server.
+                        # The second half is reserved for sending the bytes to the browser.
+                        job["percent"] = round(min(49.9, 50 * (min(st["stage"], n - 1) + min(1, done / total)) / n), 1) if total else None
                         job.update(speed=s.get("speed"), eta=s.get("eta"), status="downloading",
                                    message=f"{done/1048576:.1f} MB" + (f" of {total/1048576:.1f} MB" if total else ""))
                     elif s.get("status") == "finished":
-                        job.update(status="processing", message="Finishing up", speed=None, eta=None)
+                        job.update(status="processing", message="Finishing up", speed=None, eta=None, percent=49.9)
 
                 opts["progress_hooks"] = [on_progress]
-                opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=99.9))]
+                opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=49.9))]
                 job.update(status="downloading", message="Connecting")
                 ydl = None
                 try:
@@ -619,7 +624,9 @@ class Jobs:
                          if not n.endswith((".part", ".ytdl", ".temp", ".jpg", ".png", ".webp"))]
                 if not files:
                     raise RuntimeError("The download finished without producing a file." + (f" It may be larger than this server's {MAX_MB} MB limit." if MAX_MB else ""))
-                self.finish(job, "completed", "Ready to save", files=files)
+                job.update(delivery_total=sum(size for _, size in files), delivery_sent=0,
+                           delivery_by_file={}, delivery_done=set(), delivery_active=set())
+                self.finish(job, "ready", "Starting browser download", files=files)
         except BaseException as e:   # a worker thread must never take the app down
             if job["cancel"].is_set() or isinstance(e, DownloadCancelled):
                 self.finish(job, "cancelled", "Cancelled", percent=0)
@@ -854,22 +861,90 @@ class Handler(BaseHTTPRequestHandler):
             job = jobs.items.get(jid)
             ok = bool(job and job["owner"] == f"{self.sid()}:{tab}" and job["dl"] == dl and idx.isdigit() and int(idx) < len(job["files"]))
             if ok:
-                name, size = job["files"][int(idx)]
+                file_index = int(idx)
+                name, size = job["files"][file_index]
                 full = os.path.join(job["staging"], name)
+                track = job["status"] in ("ready", "sending") and file_index not in job["delivery_done"]
+                if track and file_index in job["delivery_active"]:
+                    return self.send_json({"error": "This file is already being sent to your browser."}, 409)
+                if track:
+                    job["delivery_active"].add(file_index)
+                    job["delivery_by_file"][file_index] = 0
+                    job.update(status="sending", message="Sending to your browser", speed=None, eta=None, finished=0)
         if not ok:
             return self.send_json({"error": "File expired. Download it again."}, 404)
         try:
             f = open(full, "rb")
         except OSError:
+            if track:
+                with jobs.lock:
+                    job["delivery_active"].discard(file_index)
+                    job["delivery_by_file"].pop(file_index, None)
+                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                    active = bool(job["delivery_active"])
+                    pct = 50 + 50 * job["delivery_sent"] / max(1, job["delivery_total"])
+                    job.update(status="sending" if active else "ready", percent=round(min(99.9, pct), 1),
+                                message="File unavailable. Choose Save to retry." if not active else "Sending to your browser",
+                                finished=0 if active else time.time())
             return self.send_json({"error": "File expired. Download it again."}, 404)
+        sent, started, transferred = 0, time.monotonic(), False
         with f:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(size))
-            self.nocache()
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
-            self.end_headers()
-            shutil.copyfileobj(f, self.wfile, 1 << 20)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.nocache()
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
+                self.end_headers()
+                while True:
+                    block = f.read(1 << 20)
+                    if not block:
+                        break
+                    if job.get("purged") or job["cancel"].is_set():
+                        raise ConnectionError("The page session ended.")
+                    self.wfile.write(block)
+                    self.wfile.flush()
+                    sent += len(block)
+                    if track:
+                        now = time.monotonic()
+                        with jobs.lock:
+                            if not job.get("purged"):
+                                job["delivery_by_file"][file_index] = sent
+                                job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                                total = max(1, job["delivery_total"])
+                                pct = min(99.9, 50 + 50 * job["delivery_sent"] / total)
+                                speed = sent / max(.001, now - started)
+                                left = max(0, total - job["delivery_sent"])
+                                job.update(percent=round(pct, 1),
+                                           speed=speed, eta=left / speed if speed else None,
+                                           message=f"Sending to browser: {job['delivery_sent']/1048576:.1f} of {total/1048576:.1f} MB")
+                if sent != size:
+                    raise ConnectionError("The browser transfer ended early.")
+                transferred = True
+            except (ConnectionError, OSError, TimeoutError):
+                # The browser may cancel a large transfer; retain the server copy so it can be retried.
+                pass
+        if track:
+            with jobs.lock:
+                job["delivery_active"].discard(file_index)
+                if transferred and not job.get("purged"):
+                    job["delivery_done"].add(file_index)
+                    job["delivery_by_file"][file_index] = size
+                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                    if len(job["delivery_done"]) == len(job["files"]):
+                        job.update(status="completed", message="Saved to your browser", speed=None, eta=None,
+                                    finished=time.time(), percent=100)
+                    else:
+                        job.update(status="sending", message="Sending remaining files to your browser", finished=0)
+                elif not job.get("purged"):
+                    job["delivery_by_file"].pop(file_index, None)
+                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                    active = bool(job["delivery_active"])
+                    pct = 50 + 50 * job["delivery_sent"] / max(1, job["delivery_total"])
+                    job.update(status="sending" if active else "ready", percent=round(min(99.9, pct), 1),
+                                speed=None, eta=None,
+                                message="Transfer interrupted; choose Save to retry." if not active else "Sending to your browser",
+                                finished=0 if active else time.time())
 
     def handle_request(self, method):
         path = urlparse(self.path).path
