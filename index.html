@@ -201,7 +201,7 @@ label.btn{display:inline-block}
     <div class="acts" style="margin-top:12px"><button class="btn go sm" id="upd" type="button">Update yt-dlp</button></div>
     <p class="hint" id="uMsg"></p>
   </section>
-  <p class="priv">Your login choice, cookies and finished files are cleared when you close this tab or hard-refresh with Ctrl+Shift+R.</p>
+  <p class="priv">Closing this tab or hard-refreshing it cancels its jobs and removes the app's temporary cookie copy, search data, and download files. Your browser's saved login, original cookies.txt file, and files already saved to Downloads remain.</p>
 </aside>
 <div class="glass search"><input id="url" type="url" placeholder="Paste a video or playlist link" aria-label="Video link" autofocus>
 <button class="btn soft" id="paste" type="button">Paste</button><button class="btn go" id="find" type="button">Find formats</button></div>
@@ -233,14 +233,15 @@ label.btn{display:inline-block}
 <script>
 const $=s=>$d.querySelector(s),$d=document,TOK=$('meta[name=tok]').content,FRESH=$('meta[name=fresh]').content==="1";
 const rid=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),b=>b.toString(16).padStart(2,"0")).join("");
-let TAB=sessionStorage.getItem("tab");
+let TAB=sessionStorage.getItem("tab");const PREV=TAB;
 const beacon=(p,t)=>fetch(p,{method:"POST",keepalive:true,headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":t},body:"{}"}).catch(()=>{});
-if(FRESH&&TAB){beacon("/api/session/end",TAB);TAB=null}   /* Ctrl+Shift+R: wipe the previous session */
+const READY=FRESH&&PREV?beacon("/api/session/end",PREV):Promise.resolve();
+if(FRESH&&TAB)TAB=null;
 if(!TAB){TAB=rid();sessionStorage.setItem("tab",TAB)}
-addEventListener("pagehide",e=>{if(!e.persisted)beacon("/api/session/leave",TAB)});   /* tab closed (a quick reload comes back and cancels this) */
+addEventListener("pagehide",e=>{if(!e.persisted)beacon("/api/session/leave",TAB)});
 addEventListener("pageshow",e=>{if(e.persisted)location.reload()});
 const S={info:{},res:null,tab:"video",height:null,vf:-1,af:-1},saved=new Set(),ACTIVE=new Set();let timer=null,fails=0;
-async function api(p,d){const r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":TAB},body:d?JSON.stringify(d):undefined});
+async function api(p,d){await READY;const r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":TOK,"X-Tab":TAB},body:d?JSON.stringify(d):undefined});
 let v={};try{v=await r.json()}catch{}if(!r.ok){const e=Error(v.error||"Request failed");e.fix=v.fix;throw e}return v}
 const el=(t,c,x)=>{const e=$d.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 const toast=(m,bad)=>{const t=el("div","toast"+(bad?" bad":""),m);$("#toasts").append(t);setTimeout(()=>t.remove(),bad?6000:3500)};
@@ -363,7 +364,7 @@ $("#tabV").onclick=()=>setTab("video");$("#tabA").onclick=()=>setTab("audio");
 $("#target").onchange=sync;$("#plAll").onclick=()=>{const b=[...$d.querySelectorAll("#plist input")],on=b.some(x=>!x.checked);b.forEach(x=>x.checked=on);sync()};
 
 $("#queue").onclick=async()=>{
-  const r=S.res,a=S.tab==="audio",base={mode:(r.live&&S.tab==="video")?"live":S.tab,embed:$("#embed").checked,target:$("#target").value,aquality:$("#aq").value};
+  const r=S.res,a=S.tab==="audio",base={mode:(r.live&&S.tab==="video")?"live":S.tab,embed:$("#embed").checked,target:$("#target").value,aquality:$("#aq").value,force_generic:!!r.force_generic};
   const label=r.live&&!a?"Live":a?$("#target").value.toUpperCase():S.vf>=0?r.formats[S.vf].label:S.height?S.height+"p":"Best";
   const list=[];
   if(r.type==="playlist")$d.querySelectorAll("#plist input:checked").forEach(cb=>{const e=r.entries[+cb.dataset.i];list.push({...base,url:e.url,title:e.title,height:S.height,label})});

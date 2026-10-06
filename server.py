@@ -10,8 +10,11 @@ LOG = os.path.join(HERE, "stypzy-error.log")
 
 
 def log_crash(note=""):
-    """Print the traceback and keep a copy next to server.py so the reason is never lost."""
-    text = traceback.format_exc()
+    """Keep diagnostic stack frames without saving exception text that may contain a URL."""
+    exc_type, _, tb = sys.exc_info()
+    text = "".join(traceback.format_tb(tb))
+    if exc_type:
+        text += f"{exc_type.__name__}: [details omitted for privacy]\n"
     print("\n" + (note + "\n" if note else "") + text, flush=True)
     try:
         with open(LOG, "a", encoding="utf-8") as f:
@@ -69,7 +72,9 @@ if ARIA2 and not os.path.isfile(ARIA2):
 SLOTS, ALLOWED_HOSTS, TERMINAL = threading.Semaphore(2), set(), ("completed", "cancelled", "error")
 TTL = 1800  # seconds a finished file stays available
 BROWSERS = ("chrome", "edge", "firefox", "brave", "opera", "chromium")
-LATEST, SESS, SESS_LOCK = {"v": None}, {}, threading.Lock()   # SESS = per-tab login settings, wiped on refresh/close
+LATEST, SESS, SESS_LOCK = {"v": None}, {}, threading.Lock()   # per-tab login settings
+ENDED_TABS, SEARCH_LOCK = {}, threading.Lock()
+PENDING_DELETE, DELETE_LOCK = set(), threading.Lock()
 LAN = "--lan" in sys.argv     # opt-in: let other devices on your network use this server
 LOCAL_ONLY = ("/api/update", "/api/login/test")   # only the computer running the app may use these
 
@@ -86,7 +91,7 @@ if PUBLIC:
         print("NOTE: no APP_PASSWORD set, so anyone with the link can use this server.", flush=True)
 AUTH_COOKIE = hmac.new(APP_PASSWORD.encode(), b"stypzy-auth", hashlib.sha256).hexdigest() if APP_PASSWORD else ""
 FAILS = {}   # ip -> (failed logins, first failure time)
-IDLE = 1800 if PUBLIC else 21600   # seconds without activity before a tab's data is wiped
+IDLE = 900 if PUBLIC else 300      # fallback cleanup if the browser cannot notify us that its tab closed
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stypzy Video - Sign in</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#070812;color:#f1f2fb;font:15px system-ui,sans-serif}
@@ -117,11 +122,42 @@ def cookie_path(tab):
     return os.path.join(WORK, "ck-" + hashlib.sha256(tab.encode()).hexdigest()[:24] + ".txt")
 
 
+def remove_path(path, retry=True):
+    """Remove app-owned temporary data, retrying paths that Windows still has open."""
+    if not path:
+        return
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        if retry:
+            with DELETE_LOCK:
+                PENDING_DELETE.add(path)
+
+
+def clear_yt_dlp_cookies(ydl):
+    """Drop yt-dlp's in-memory cookie jar as soon as its operation is done."""
+    if ydl is None:
+        return
+    jar = getattr(ydl, "cookiejar", None)
+    if jar is not None:
+        try:
+            jar.clear()
+        except Exception:
+            pass
+
+
 def touch(tab):
     """Mark a browser tab as active and return its private login settings."""
     if not tab:
         return None
     with SESS_LOCK:
+        if tab in ENDED_TABS:
+            return None
         s = SESS.setdefault(tab, {"method": "none", "browser": "", "cookies": False, "domains": [], "count": 0})
         s["seen"], s["close_at"] = time.time(), 0
         return s
@@ -133,26 +169,60 @@ def public_state(tab):
 
 
 def wipe_tab(tab):
-    """Forget everything about one tab: downloads, files, cookies and login choice."""
+    """Expire one page session and remove its app-owned files and metadata."""
     if not tab:
         return
-    jobs.wipe_tab(tab)
     with SESS_LOCK:
+        ENDED_TABS[tab] = time.time()
         SESS.pop(tab, None)
-    try:
-        os.remove(cookie_path(tab))
-    except OSError:
-        pass
+    purge_tab_data(tab)
+
+
+def purge_tab_data(tab):
+    """Clear the resources owned by a tab after its session has been expired."""
+    jobs.wipe_tab(tab)
+    with SEARCH_LOCK:
+        for key, entry in list(searches.items()):
+            if entry["tab"] == tab:
+                entry["cancel"].set()
+                entry["record"].clear()
+                searches.pop(key, None)
+    remove_path(cookie_path(tab))
+    # Remove older diagnostic logs that might contain a URL from a prior version.
+    remove_path(LOG)
+
+
+def expire_if_idle(tab, now):
+    with SESS_LOCK:
+        s = SESS.get(tab)
+        if not s:
+            return
+        closing = s.get("close_at") and now > s["close_at"]
+        idle = now - s.get("seen", now) > IDLE
+        if not (closing or idle):
+            return
+        ENDED_TABS[tab] = now
+        SESS.pop(tab, None)
+    purge_tab_data(tab)
 
 
 def reaper():
     while True:
         time.sleep(5)
         now = time.time()
-        for tab, s in list(SESS.items()):
-            closed = s.get("close_at") and now > s["close_at"] and s.get("seen", 0) < s["close_at"] - 12
-            if closed or now - s.get("seen", now) > IDLE:
-                wipe_tab(tab)
+        with SESS_LOCK:
+            tabs = list(SESS)
+        for tab in tabs:
+            expire_if_idle(tab, now)
+        with SESS_LOCK:
+            for tab, ended_at in list(ENDED_TABS.items()):
+                if now - ended_at > 86400:
+                    ENDED_TABS.pop(tab, None)
+        with DELETE_LOCK:
+            retrying = list(PENDING_DELETE)
+            PENDING_DELETE.clear()
+        for path in retrying:
+            remove_path(path)
 
 
 def apply_auth(opts, tab=""):
@@ -169,34 +239,76 @@ def apply_auth(opts, tab=""):
     return opts
 
 
+def has_auth(tab):
+    with SESS_LOCK:
+        s = SESS.get(tab) or {}
+        return bool((s.get("method") == "file" and s.get("cookies") and os.path.isfile(cookie_path(tab)))
+                    or (s.get("method") == "browser" and s.get("browser") and not PUBLIC))
+
+
 def parse_cookies(txt):
-    """Validate a Netscape cookies.txt. Returns (cookie count, top domains)."""
+    """Normalize a Netscape cookies.txt. Returns (text, cookie count, top domains)."""
     if len(txt) > 1_500_000 or "\x00" in txt:
         raise ValueError("That file is too large or isn't a text file.")
+    txt = txt.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = txt.split("\n")
     n, doms = 0, {}
-    for line in txt.splitlines():
-        if not line.strip() or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+    for line in lines:
+        marker = line.lstrip()
+        if not line.strip() or (marker.startswith("#") and not marker.startswith("#HttpOnly_")):
             continue
         parts = line.split("\t")
         if len(parts) != 7:
             raise ValueError("That isn't a Netscape-format cookies.txt (each line needs 7 tab-separated fields).")
-        d = parts[0].replace("#HttpOnly_", "").lstrip(".")
+        d = parts[0].replace("#HttpOnly_", "").lstrip(".").lower()
+        if (not d or parts[1].upper() not in ("TRUE", "FALSE") or not parts[2].startswith("/")
+                or parts[3].upper() not in ("TRUE", "FALSE") or not re.fullmatch(r"-?\d+", parts[4]) or not parts[5]):
+            raise ValueError("That cookies.txt contains an invalid Netscape cookie row. Export it again in Netscape format.")
         doms[d], n = doms.get(d, 0) + 1, n + 1
     if not n:
         raise ValueError("No cookies found in that file.")
-    return n, sorted(doms, key=doms.get, reverse=True)[:6]
+    header = lines[0].strip().lower() if lines else ""
+    if header not in ("# http cookie file", "# netscape http cookie file"):
+        lines.insert(0, "# Netscape HTTP Cookie File")
+    return "\n".join(lines).rstrip("\n") + "\n", n, sorted(doms, key=doms.get, reverse=True)[:6]
+
+
+def validate_cookie_file(path):
+    """Ask yt-dlp's own cookie loader to parse the normalized file before accepting it."""
+    from yt_dlp.cookies import load_cookies
+    ydl, jar = None, None
+    try:
+        ydl = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": Silent()})
+        with ydl:
+            jar = load_cookies(path, None, ydl)
+            return sum(1 for _ in jar)
+    except Exception as e:
+        raise ValueError("yt-dlp couldn't read this cookies.txt. Export it in Netscape format and try again.") from e
+    finally:
+        if jar is not None:
+            try:
+                jar.clear()
+            except Exception:
+                pass
+        clear_yt_dlp_cookies(ydl)
 
 
 def test_browser_login(browser):
     from yt_dlp.cookies import extract_cookies_from_browser
     jar = extract_cookies_from_browser(browser, None, Silent())
-    doms = {}
-    for c in jar:
-        d = (c.domain or "").lstrip(".")
-        doms[d] = doms.get(d, 0) + 1
-    if not doms:
-        raise ValueError("That browser has no saved logins yet. Sign in to the site in that browser first.")
-    return sum(doms.values()), sorted(doms, key=doms.get, reverse=True)[:6]
+    try:
+        doms = {}
+        for c in jar:
+            d = (c.domain or "").lstrip(".")
+            doms[d] = doms.get(d, 0) + 1
+        if not doms:
+            raise ValueError("That browser has no saved logins yet. Sign in to the site in that browser first.")
+        return sum(doms.values()), sorted(doms, key=doms.get, reverse=True)[:6]
+    finally:
+        try:
+            jar.clear()
+        except Exception:
+            pass
 
 
 def check_url(url):
@@ -261,14 +373,29 @@ FRIENDLY = (
 )
 
 
-def friendly(e):
+def friendly(e, tab=""):
     """Plain-English message plus which settings fix to offer ('login', 'update' or '')."""
     msg = clean_error(e)
     low = msg.lower()
+    if any(term in low for term in ("netscape format", "failed to load cookies", "couldn't read cookies")):
+        return "yt-dlp couldn't read the cookies.txt file. Export it again in Netscape format and try again.", "login"
+    s = SESS.get(tab) if tab else None
+    auth_active = bool(s and (
+        (s.get("method") == "file" and s.get("cookies") and os.path.isfile(cookie_path(tab)))
+        or (s.get("method") == "browser" and s.get("browser") and not PUBLIC)))
+    if auth_active and any(term in low for term in ("http error 401", "http error 403", "forbidden", "login required", "sign in", "not logged in")):
+        return ("The site rejected access. Check that this browser or cookies.txt is signed in to this exact site, then refresh the login and try again. Some sites also block downloader access.", "login")
     for needles, fix, text in FRIENDLY:
         if any(n in low for n in needles):
             return text, fix
     return msg, ""
+
+
+def generic_retry_worthwhile(e):
+    """Whether a failed site extractor might be recoverable from the page/embed itself."""
+    low = str(e).lower()
+    return any(term in low for term in ("unsupported url", "no video formats", "unable to extract",
+                                         "failed to extract", "could not extract"))
 
 
 def fmt_duration(sec):
@@ -288,14 +415,17 @@ class Live:
     STEPS = (("Extracting URL", "Connecting to the site"), ("webpage", "Reading the page"), ("player", "Loading player data"),
              ("manifest", "Reading stream lists"), ("m3u8", "Reading stream lists"), ("Downloading", "Collecting formats"))
 
-    def __init__(self, rec):
-        self.rec, self.n = rec, 0
+    def __init__(self, rec, cancel=None):
+        self.rec, self.n, self.cancel = rec, 0, cancel
 
     def debug(self, msg):
         for key, text in self.STEPS:
             if key in msg:
                 self.n += 1
-                self.rec.update(message=text, percent=min(88, 12 + self.n * 11))
+                with SEARCH_LOCK:
+                    if self.cancel and self.cancel.is_set():
+                        return
+                    self.rec.update(message=text, percent=min(88, 12 + self.n * 11))
                 break
 
     info = warning = error = lambda self, _: None
@@ -333,11 +463,14 @@ def build_options(job, d, staging):
             "windowsfilenames": True, "noplaylist": True, "quiet": True, "no_warnings": True, "logger": Silent(),
             "retries": 3, "fragment_retries": 3, "continuedl": True,
             "concurrent_fragment_downloads": 8}   # fetch several stream fragments at once (HLS/DASH)
+    if d.get("force_generic"):
+        opts["force_generic_extractor"] = True
     if re.search(r"(youtube\.com|youtu\.be)", str(d.get("url", ""))):
         opts["http_chunk_size"] = 10 * 1024 * 1024   # ranged chunks avoid YouTube's single-stream throttling
     if MAX_MB:
         opts["max_filesize"] = MAX_MB * 1048576
-    if ARIA2 and mode != "live":
+    # Avoid passing authenticated request headers to an external downloader process.
+    if ARIA2 and mode != "live" and not has_auth(job.get("tab", "")):
         # many parallel connections to the same file: the biggest speed-up on throttled sites
         opts["external_downloader"] = {"default": ARIA2}
         opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
@@ -359,30 +492,44 @@ class Jobs:
         self.items, self.lock = {}, threading.Lock()
 
     def create(self, d, owner=""):
+        tab = owner.partition(":")[2]
         thumb = str(d.get("thumb") or "")
         job = {"id": uuid.uuid4().hex, "dl": secrets.token_urlsafe(16), "title": str(d.get("title") or d["url"])[:200],
                "thumb": thumb if thumb.startswith("http") else "", "label": str(d.get("label") or "")[:60],
                "status": "queued", "percent": 0, "speed": None, "eta": None, "message": "Waiting for a free slot",
                "error": "", "files": [], "created": time.time(), "finished": 0, "stages": 1, "staging": None,
-               "cancel": threading.Event(), "stop": threading.Event(), "live": d.get("mode") == "live", "data": d, "owner": owner, "tab": owner.partition(":")[2], "fix": ""}
-        with self.lock:
-            if sum(1 for j in self.items.values() if j["owner"] == owner and j["status"] not in TERMINAL) >= MAX_ACTIVE:
-                raise ValueError(f"You already have {MAX_ACTIVE} downloads in progress. Wait for one to finish.")
-            self.items[job["id"]] = job
+               "cancel": threading.Event(), "stop": threading.Event(), "purged": False, "live": d.get("mode") == "live", "data": d, "owner": owner, "tab": tab, "fix": ""}
+        with SESS_LOCK:
+            if tab in ENDED_TABS:
+                raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
+            with self.lock:
+                if sum(1 for j in self.items.values() if j["owner"] == owner and j["status"] not in TERMINAL) >= MAX_ACTIVE:
+                    raise ValueError(f"You already have {MAX_ACTIVE} downloads in progress. Wait for one to finish.")
+                self.items[job["id"]] = job
         threading.Thread(target=self.run, args=(job,), daemon=True).start()
         return job["id"]
 
     def drop(self, k):
         j = self.items.pop(k, None)
-        if j and j["staging"]:
-            shutil.rmtree(j["staging"], ignore_errors=True)
+        if not j:
+            return
+        j["purged"] = True
+        if j["status"] not in TERMINAL:
+            j["cancel"].set()
+            j["stop"].set()
+        remove_path(j.get("staging"))
+        j["staging"] = None
+        j["files"].clear()
+        if isinstance(j.get("data"), dict):
+            j["data"].clear()
+        j.update(title="", thumb="", label="", error="", message="Removed")
 
     def listing(self, owner=None):
         with self.lock:
             for k in [k for k, j in self.items.items() if j["status"] in TERMINAL and time.time() - j["finished"] > TTL]:
                 self.drop(k)
             return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab")},
-                     "files": [{"name": n, "size": s, "url": f"/file/{j['id']}/{j['dl']}/{i}"} for i, (n, s) in enumerate(j["files"])]}
+                     "files": [{"name": n, "size": s, "url": f"/file/{j['id']}/{j['dl']}/{i}?tab={quote(j['tab'])}"} for i, (n, s) in enumerate(j["files"])]}
                     for j in sorted(self.items.values(), key=lambda j: -j["created"]) if owner is None or j["owner"] == owner]
 
     def finish(self, job, status, message, **extra):
@@ -416,7 +563,6 @@ class Jobs:
             return
         with self.lock:
             for k in [k for k, j in self.items.items() if j["tab"] == tab]:
-                self.items[k]["cancel"].set()
                 self.drop(k)
 
     def clear(self, owner=None):
@@ -426,6 +572,7 @@ class Jobs:
 
     def run(self, job):
         d = job["data"]
+        staging = None
         try:
             with SLOTS:
                 def check():
@@ -434,7 +581,9 @@ class Jobs:
                 check()
                 os.makedirs(WORK, exist_ok=True)
                 job["staging"] = staging = tempfile.mkdtemp(dir=WORK)
+                check()
                 opts, st = build_options(job, d, staging), {"file": None, "stage": -1}
+                check()
 
                 def on_progress(s):
                     check()
@@ -455,12 +604,16 @@ class Jobs:
                 opts["progress_hooks"] = [on_progress]
                 opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=99.9))]
                 job.update(status="downloading", message="Connecting")
+                ydl = None
                 try:
-                    with yt_dlp.YoutubeDL(opts) as y:
-                        y.download([d["url"]])
+                    ydl = yt_dlp.YoutubeDL(opts)
+                    with ydl:
+                        ydl.download([d["url"]])
                 except StopRec:
                     job.update(status="processing", message="Saving your recording", speed=None, eta=None)
                     salvage(staging)
+                finally:
+                    clear_yt_dlp_cookies(ydl)
                 check()
                 files = [(n, os.path.getsize(os.path.join(staging, n))) for n in sorted(os.listdir(staging))
                          if not n.endswith((".part", ".ytdl", ".temp", ".jpg", ".png", ".webp"))]
@@ -471,28 +624,74 @@ class Jobs:
             if job["cancel"].is_set() or isinstance(e, DownloadCancelled):
                 self.finish(job, "cancelled", "Cancelled", percent=0)
                 if job["staging"]:
-                    shutil.rmtree(job["staging"], ignore_errors=True)
+                    remove_path(job["staging"])
+                    job["staging"] = None
             else:
                 if not isinstance(e, (DownloadError, ValueError, RuntimeError)):
                     log_crash("Unexpected download error")
-                msg, fix = friendly(e)
+                msg, fix = friendly(e, job.get("tab", ""))
                 self.finish(job, "error", "Download failed", error=msg, fix=fix)
+        finally:
+            # The original link/options are no longer needed after an attempt finishes.
+            if isinstance(d, dict):
+                d.clear()
+            job["data"] = {}
+            if job.get("purged") or job["cancel"].is_set():
+                remove_path(staging)
+                job["staging"] = None
+                job["files"].clear()
 
 
 jobs, searches = Jobs(), {}
 
 
-def do_search(rec, url, tab=""):
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": Live(rec), "noplaylist": True,
+class SearchCancelled(Exception):
+    pass
+
+
+def extract_with_auth(url, opts, tab=""):
+    ydl = None
+    try:
+        ydl = yt_dlp.YoutubeDL(apply_auth(opts, tab))
+        with ydl:
+            return ydl.extract_info(url, download=False)
+    finally:
+        clear_yt_dlp_cookies(ydl)
+
+
+def do_search(rec, url, tab="", cancel=None):
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": Live(rec, cancel), "noplaylist": True,
             "extract_flat": "in_playlist", "playlistend": 25 if PUBLIC else 200}
-    with yt_dlp.YoutubeDL(apply_auth(opts, tab)) as y:
-        info = y.extract_info(url, download=False)
-    rec.update(message="Building the format list", percent=95)
+    if cancel and cancel.is_set():
+        raise SearchCancelled()
+    used_generic = False
+    try:
+        info = extract_with_auth(url, opts, tab)
+    except Exception as e:
+        if cancel and cancel.is_set():
+            raise SearchCancelled() from e
+        if not generic_retry_worthwhile(e):
+            raise
+        generic_opts = {**opts, "force_generic_extractor": True}
+        info = extract_with_auth(url, generic_opts, tab)
+        used_generic = True
+    if cancel and cancel.is_set():
+        raise SearchCancelled()
+    if info.get("_type") != "playlist" and not info.get("formats") and not used_generic:
+        generic_opts = {**opts, "force_generic_extractor": True}
+        info = extract_with_auth(url, generic_opts, tab)
+        used_generic = True
+    if cancel and cancel.is_set():
+        raise SearchCancelled()
+    with SEARCH_LOCK:
+        if cancel and cancel.is_set():
+            raise SearchCancelled()
+        rec.update(message="Building the format list", percent=95)
     if info.get("_type") == "playlist":
         ents = [{"url": e.get("url") or e.get("webpage_url"), "title": e.get("title") or "Untitled", "duration": fmt_duration(e.get("duration"))}
                 for e in info.get("entries") or [] if e and str(e.get("url") or e.get("webpage_url") or "").startswith("http")]
         return {"type": "playlist", "title": info.get("title") or "Playlist", "uploader": info.get("uploader") or info.get("channel") or "",
-                "count": len(ents), "entries": ents}
+                "count": len(ents), "entries": ents, "force_generic": used_generic}
     fmts, vids, auds = info.get("formats") or [], [], []
     sz = lambda f: f.get("filesize") or f.get("filesize_approx")
     best_audio = max([sz(f) or 0 for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")] or [0])
@@ -517,15 +716,24 @@ def do_search(rec, url, tab=""):
     return {"type": "video", "title": info.get("title") or "Video", "thumb": info.get("thumbnail") or "",
             "uploader": info.get("uploader") or info.get("channel") or "Unknown", "duration": fmt_duration(info.get("duration")),
             "site": info.get("extractor_key") or "", "live": bool(info.get("is_live")), "formats": vids, "audio_formats": auds,
-            "heights": sorted({r["height"] for r in vids if r["height"]}, reverse=True)}
+            "heights": sorted({r["height"] for r in vids if r["height"]}, reverse=True), "force_generic": used_generic}
 
 
-def run_search(rec, url, tab=""):
+def run_search(rec, url, tab="", cancel=None):
     try:
-        rec.update(result=do_search(rec, url, tab), status="done", message="Done", percent=100)
+        result = do_search(rec, url, tab, cancel)
+        with SEARCH_LOCK:
+            if cancel and cancel.is_set():
+                return
+            rec.update(result=result, status="done", message="Done", percent=100)
+    except SearchCancelled:
+        return
     except BaseException as e:   # never let a search thread take the app down
-        msg, fix = friendly(e)
-        rec.update(status="error", error=msg, fix=fix)
+        msg, fix = friendly(e, tab)
+        with SEARCH_LOCK:
+            if cancel and cancel.is_set():
+                return
+            rec.update(status="error", error=msg, fix=fix)
 
 
 atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
@@ -638,9 +846,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_file(self, path):
         _, jid, dl, idx = path.split("/")[1:5]
+        tab = (parse_qs(urlparse(self.path).query).get("tab") or [""])[0]
+        with SESS_LOCK:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{8,40}", tab) or tab in ENDED_TABS:
+                return self.send_json({"error": "File expired. Download it again."}, 404)
         with jobs.lock:
             job = jobs.items.get(jid)
-            ok = bool(job and job["owner"].partition(":")[0] == self.sid() and job["dl"] == dl and idx.isdigit() and int(idx) < len(job["files"]))
+            ok = bool(job and job["owner"] == f"{self.sid()}:{tab}" and job["dl"] == dl and idx.isdigit() and int(idx) < len(job["files"]))
             if ok:
                 name, size = job["files"][int(idx)]
                 full = os.path.join(job["staging"], name)
@@ -672,12 +884,14 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith(("/api/", "/file/")) and not self.authed():
                 return self.send_json({"error": "Please sign in again (reload the page)."}, 401)
             if path.startswith("/api/") and path not in ("/api/session/leave", "/api/session/end"):
-                touch(self.tab())
+                tab = self.tab()
+                if not tab or touch(tab) is None:
+                    return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
             if method == "GET":
                 if path == "/":
                     if not self.authed():
                         return self.send_html(LOGIN_HTML.replace("{{ERR}}", ""))
-                    # Ctrl+Shift+R sends "Cache-Control: no-cache"; the page then wipes its previous session
+                    # Ctrl+Shift+R marks this document to expire its previous tab session.
                     hard = "no-cache" in (self.headers.get("Cache-Control", "") + self.headers.get("Pragma", "")).lower()
                     page = open(os.path.join(HERE, "index.html"), encoding="utf-8").read().replace("{{TOKEN}}", TOKEN).replace("{{FRESH}}", "1" if hard else "0")
                     raw = page.encode()
@@ -705,8 +919,10 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/jobs":
                     return self.send_json({"jobs": jobs.listing(self.owner())})
                 if path.startswith("/api/search/"):
-                    rec = searches.get(path.rsplit("/", 1)[-1])
-                    return self.send_json({k: v for k, v in rec.items()} if rec else {"error": "Unknown search"}, 200 if rec else 404)
+                    with SEARCH_LOCK:
+                        entry = searches.get(path.rsplit("/", 1)[-1])
+                        rec = dict(entry["record"]) if entry and entry["owner"] == self.owner() else None
+                    return self.send_json(rec if rec is not None else {"error": "Unknown search"}, 200 if rec is not None else 404)
                 return self.send_json({"error": "Not found"}, 404)
             data = self.read_json()
             url = str(data.get("url", "")).strip()
@@ -716,10 +932,19 @@ class Handler(BaseHTTPRequestHandler):
                 check_url(url)
                 rec = {"status": "running", "message": "Starting", "percent": 5, "error": "", "fix": "", "result": None}
                 sid = uuid.uuid4().hex
-                searches[sid] = rec
-                while len(searches) > 100:          # keep memory bounded
-                    searches.pop(next(iter(searches)))
-                threading.Thread(target=run_search, args=(rec, url, self.tab()), daemon=True).start()
+                tab = self.tab()
+                cancel = threading.Event()
+                with SESS_LOCK:
+                    if tab in ENDED_TABS:
+                        return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
+                    with SEARCH_LOCK:
+                        searches[sid] = {"record": rec, "owner": self.owner(), "tab": tab, "cancel": cancel}
+                        while len(searches) > 100:  # keep memory bounded
+                            old_key = next(iter(searches))
+                            old = searches.pop(old_key)
+                            old["cancel"].set()
+                            old["record"].clear()
+                threading.Thread(target=run_search, args=(rec, url, tab, cancel), daemon=True).start()
                 return self.send_json({"id": sid})
             if path == "/api/download":
                 if not url.startswith(("https://", "http://")):
@@ -734,6 +959,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not tab:
                     raise ValueError("Reload the page and try again.")
                 st = touch(tab)
+                if not st:
+                    return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
                 if "browser" in data:
                     br = str(data["browser"]).lower()
                     if br and br not in BROWSERS:
@@ -742,10 +969,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise PermissionError("Reading a browser login only works on the computer running this app. Use a cookies.txt file instead.")
                     st["browser"] = br
                 if data.get("clear_cookies"):
-                    try:
-                        os.remove(cookie_path(tab))
-                    except OSError:
-                        pass
+                    remove_path(cookie_path(tab))
                     st.update(cookies=False, domains=[], count=0)
                     if st["method"] == "file":
                         st["method"] = "none"
@@ -753,12 +977,25 @@ class Handler(BaseHTTPRequestHandler):
                 if txt:
                     if PUBLIC and not APP_PASSWORD:
                         raise PermissionError("Cookie upload stays off until the server owner sets an APP_PASSWORD.")
-                    n, top = parse_cookies(str(txt))
+                    normalized, n, top = parse_cookies(str(txt))
                     os.makedirs(WORK, exist_ok=True)
-                    fd = os.open(cookie_path(tab), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-                        f.write(str(txt))
-                    st.update(cookies=True, domains=top, count=n, method="file")
+                    fd, tmp_path = tempfile.mkstemp(prefix="cookie-", suffix=".txt", dir=WORK)
+                    try:
+                        # newline=None writes CRLF on Windows, which yt-dlp's Netscape
+                        # cookie loader expects, while retaining LF on Unix-like systems.
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            f.write(normalized)
+                        parsed_count = validate_cookie_file(tmp_path)
+                        if not parsed_count:
+                            raise ValueError("No usable cookies were found. Export a fresh cookies.txt and try again.")
+                        with SESS_LOCK:
+                            if tab in ENDED_TABS or SESS.get(tab) is not st:
+                                raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
+                            os.replace(tmp_path, cookie_path(tab))
+                            st.update(cookies=True, domains=top, count=parsed_count, method="file")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            remove_path(tmp_path)
                 m = data.get("method")
                 if m in ("none", "browser", "file"):
                     if m == "browser" and not st["browser"]:
@@ -778,12 +1015,13 @@ class Handler(BaseHTTPRequestHandler):
                 except BaseException as e:
                     return self.send_json({"ok": False, "error": friendly(e)[0]})
                 return self.send_json({"ok": True, "count": n, "domains": top})
-            if path == "/api/session/leave":      # tab closed or reloading: wipe unless it comes back within seconds
-                st = SESS.get(self.tab())
-                if st:
-                    st["close_at"] = time.time() + 12
+            if path == "/api/session/leave":
+                with SESS_LOCK:
+                    st = SESS.get(self.tab())
+                    if st and self.tab() not in ENDED_TABS:
+                        st["close_at"] = time.time() + 12
                 return self.send_json({"ok": True})
-            if path == "/api/session/end":        # hard refresh: wipe the previous session right now
+            if path == "/api/session/end":
                 wipe_tab(self.tab())
                 return self.send_json({"ok": True})
             if path.startswith("/api/stop/"):
@@ -805,7 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             self.safe_error(e, 400)
         except Exception as e:
-            log_crash(f"Unhandled error on {method} {path}")
+            log_crash("Unhandled request error")
             self.safe_error(e, 500)
 
     def safe_error(self, e, status):
@@ -841,6 +1079,7 @@ def main():
         lan_ip, extra = lan_hosts(port)
         ALLOWED_HOSTS.update(extra)
     shutil.rmtree(WORK, ignore_errors=True)
+    remove_path(LOG)
     threading.Thread(target=check_latest, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
     print(f"Stypzy Video running at http://127.0.0.1:{port}  (FFmpeg: {'yes' if FFMPEG else 'no'}, aria2c: {'yes' if ARIA2 else 'no'})", flush=True)
