@@ -166,7 +166,7 @@ label.btn{display:inline-block}
 
 <div class="scrim" id="scrim"></div>
 <aside class="drawer" id="settings" role="dialog" aria-modal="true" aria-label="Login and updates">
-  <div class="dhead"><div><h2>Login and updates</h2><p class="mute">Optional. Public videos need none of this.</p></div><button class="x" id="sClose" type="button" aria-label="Close">&times;</button></div>
+  <div class="dhead"><div><h2>Login and updates</h2><p class="mute">Optional. Public videos need none of this.</p></div><div class="acts"><button class="btn soft sm hidden" id="logout" type="button">Sign out</button><button class="x" id="sClose" type="button" aria-label="Close">&times;</button></div></div>
   <div class="now" id="now"></div>
 
   <h3 class="sh">1. How should the app sign in to sites?</h3>
@@ -186,12 +186,12 @@ label.btn{display:inline-block}
       <div class="sub hidden">
         <p class="mute" id="cState">No file loaded.</p>
         <div class="acts"><label class="btn soft sm" for="cfile">Choose cookies.txt</label><input class="sr" type="file" id="cfile" accept=".txt,text/plain"><button class="btn bad sm" id="cclear" type="button">Remove</button></div>
-        <p class="hint hidden" id="bridgeHelp">Hosted browser login: install the companion extension from the project's browser-extension folder. Open this app in one tab and the signed-in platform in another, then use the extension from the platform tab. It reads cookies only for that active site and asks before sending them here. Set APP_PASSWORD on Render first.</p>
+        <p class="hint hidden" id="bridgeHelp">Hosted browser login: install the companion extension from the project's browser-extension folder. Open this app in one tab and the signed-in platform in another. The extension requests permission for the active site and asks you to approve sending its cookies. Set a strong APP_PASSWORD on Render first.</p>
         <details><summary>How do I get a cookies.txt file?</summary><ol class="how">
           <li>Sign in to the site (for example instagram.com) in your normal browser.</li>
           <li>Install a cookies exporter extension, such as "Get cookies.txt LOCALLY".</li>
           <li>Open the site, click the extension and choose Export.</li>
-          <li>Come back here and choose the saved file. Treat it like a password and delete it afterwards.</li></ol></details>
+          <li>Come back here and choose the saved file. Some exports contain cookies for many sites. Check the domains shown, treat the file like a password, and delete it from your computer after use.</li></ol></details>
       </div></div>
   </div>
 
@@ -202,7 +202,7 @@ label.btn{display:inline-block}
     <div class="acts" style="margin-top:12px"><button class="btn go sm" id="upd" type="button">Update yt-dlp</button></div>
     <p class="hint" id="uMsg"></p>
   </section>
-  <p class="priv">Closing this tab or hard-refreshing it cancels its jobs and removes the app's temporary cookie copy, search data, and download files. Your browser's saved login, original cookies.txt file, and files already saved to Downloads remain.</p>
+  <p class="priv">Uploaded cookies are kept in server memory, not saved as a cookie file. Closing this tab, signing out, or removing cookies cancels its active work and clears app-held copies when each request stops. Browser login uses yt-dlp's reader, which can make a temporary database copy in the operating system's temp folder; normal cleanup removes it, but no app can promise forensic erasure from RAM, swap, or SSD storage. The server operator can access cookies while they are in use. Your browser login and original cookies.txt file remain; downloaded video files are separate.</p>
 </aside>
 <div class="glass search"><input id="url" type="url" placeholder="Paste a video or playlist link" aria-label="Video link" autofocus>
 <button class="btn soft" id="paste" type="button">Paste</button><button class="btn go" id="find" type="button">Find formats</button></div>
@@ -231,7 +231,7 @@ label.btn{display:inline-block}
 <div id="jobs"></div>
 </main>
 <div id="toasts" role="status" aria-live="polite"></div>
-<script>
+<script nonce="{{NONCE}}">
 const $=s=>$d.querySelector(s),$d=document,TOK=$('meta[name=tok]').content,FRESH=$('meta[name=fresh]').content==="1";
 const rid=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),b=>b.toString(16).padStart(2,"0")).join("");
 let TAB=sessionStorage.getItem("tab");const PREV=TAB;
@@ -261,6 +261,7 @@ function lockText(b){
    :`Fully close ${BN[b]} first, including its icon in the system tray, or Windows keeps its saved logins locked. Newer ${BN[b]} versions also encrypt cookies in a way that can still block this. If Test fails, use Firefox or a cookies.txt file.`}
 function paintInfo(){
   const i=S.info,pub=i.public,m=i.method;
+  $("#logout").classList.toggle("hidden",!pub);
   $("#pFf").textContent=i.ffmpeg?"FFmpeg ready":"FFmpeg not found";$("#pFf").className="pill "+(i.ffmpeg?"ok":"warn");
   $("#pYt").textContent=i.update?`yt-dlp ${i.ytdlp} - update available`:"yt-dlp "+i.ytdlp;$("#pYt").className="pill "+(i.update?"up":"ok");
   const who=m==="browser"?`Signed in through your ${BN[i.browser]} login`:m==="file"?`Signed in with cookies.txt (${i.count} cookies)`:"No login. Public videos only";
@@ -268,7 +269,7 @@ function paintInfo(){
   $d.querySelectorAll(".mo").forEach(o=>{const k=o.dataset.m,on=k===pick;o.setAttribute("aria-checked",on);const sub=o.querySelector(".sub");if(sub)sub.classList.toggle("hidden",!on)});
   $(".mo[data-m=browser]").classList.toggle("off",!i.can_browser);$(".mo[data-m=file]").classList.toggle("off",!i.can_cookies);
   $("#bWhy").textContent=i.can_browser?"Reads that browser's saved login on this computer.":pub?"Render cannot read this computer's browser profile. Import from a signed-in tab with the companion extension, or upload cookies.txt.":"Only works on the computer that runs the app. Use a cookies.txt file.";
-  $("#cWhy").textContent=i.can_cookies?(pub?"Upload cookies.txt or import from the companion browser extension.":"Most reliable for Chrome, Edge and Brave logins."):"Turned off until the server owner sets an APP_PASSWORD.";
+  $("#cWhy").textContent=i.can_cookies?(pub?"Upload cookies.txt or import from the companion browser extension.":"Most reliable for Chrome, Edge and Brave logins."):pub?"Turned off until the server owner sets an APP_PASSWORD.":"Cookie upload is limited to the computer running the app in LAN mode.";
   $("#bridgeHelp").classList.toggle("hidden",!pub);
   $("#detect").textContent=ME?`This page is open in ${BN[ME]}.`:"";
   const sel=$("#browser");if(sel.value!==i.browser){sel.value=i.browser;sel.dispatchEvent(new Event("sync"))}
@@ -282,6 +283,7 @@ async function init(){S.info=await api("/api/info");ME=await detectMe();pick=S.i
   setTimeout(()=>api("/api/ping").catch(()=>{}),3000);setInterval(()=>api("/api/ping").catch(()=>{}),60000)}
 function openSet(o){$("#settings").classList.toggle("open",o);$("#scrim").classList.toggle("open",o);$d.body.classList.toggle("lock",o);$("#pSet").setAttribute("aria-expanded",o);if(o)$("#sClose").focus()}
 $("#pSet").onclick=()=>openSet(true);$("#sClose").onclick=()=>openSet(false);$("#scrim").onclick=()=>openSet(false);
+$("#logout").onclick=async()=>{const b=$("#logout");b.disabled=true;try{await api("/api/logout",{});location.reload()}catch(e){toast(e.message,1);b.disabled=false}};
 $("#pYt").onclick=()=>{if(S.info.update)openSet(true)};$("#fixBtn").onclick=()=>openSet(true);
 $d.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#settings").classList.contains("open"))openSet(false)});
 async function saveSettings(p,msg){try{Object.assign(S.info,await api("/api/settings",p));paintInfo();if(msg)toast(msg)}catch(e){toast(e.message,1);paintInfo()}}

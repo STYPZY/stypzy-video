@@ -1,26 +1,20 @@
 """Stypzy Video v2 - run: python server.py   (needs: python -m pip install -U yt-dlp)
 Files are prepared in a temp folder, then streamed to the browser's download flow."""
-import atexit, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
+import atexit, hmac, ipaddress, io, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote, parse_qs
 from http.cookies import SimpleCookie
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOG = os.path.join(HERE, "stypzy-error.log")
 
 
 def log_crash(note=""):
-    """Keep diagnostic stack frames without saving exception text that may contain a URL."""
+    """Print diagnostic stack frames without saving exception text that may contain a URL."""
     exc_type, _, tb = sys.exc_info()
     text = "".join(traceback.format_tb(tb))
     if exc_type:
         text += f"{exc_type.__name__}: [details omitted for privacy]\n"
     print("\n" + (note + "\n" if note else "") + text, flush=True)
-    try:
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {note}\n{text}\n")
-    except OSError:
-        pass
 
 
 def pause():
@@ -82,15 +76,14 @@ LOCAL_ONLY = ("/api/update", "/api/login/test")   # only the computer running th
 PUBLIC = bool(os.environ.get("RENDER") or os.environ.get("STYPZY_PUBLIC"))
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PROXY = os.environ.get("YTDLP_PROXY", "")                                  # optional: route yt-dlp through a proxy
+AUTH_COOKIE_TTL = 86400                                                       # require hosted users to reauthenticate daily
 MAX_MB = int(os.environ.get("MAX_MB", "400")) if PUBLIC else 0              # largest file a visitor may fetch
 MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE", "2")) if PUBLIC else 99       # active downloads per visitor
 if PUBLIC:
     SLOTS = threading.Semaphore(int(os.environ.get("MAX_JOBS", "1")))       # free instances are tiny: 1 at a time
     TTL = 900
-    if not APP_PASSWORD:
-        print("NOTE: no APP_PASSWORD set, so anyone with the link can use this server.", flush=True)
-AUTH_COOKIE = hmac.new(APP_PASSWORD.encode(), b"stypzy-auth", hashlib.sha256).hexdigest() if APP_PASSWORD else ""
-FAILS = {}   # ip -> (failed logins, first failure time)
+FAILS, FAILS_LOCK = {}, threading.Lock()   # ip -> (login attempts, first attempt time)
+AUTH_SESSIONS, AUTH_LOCK = {}, threading.Lock()  # random bearer token -> expiry time
 IDLE = 900 if PUBLIC else 300      # fallback cleanup if the browser cannot notify us that its tab closed
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stypzy Video - Sign in</title>
@@ -118,10 +111,6 @@ class StopRec(Exception):
     """Raised to end a live recording but keep what was captured."""
 
 
-def cookie_path(tab):
-    return os.path.join(WORK, "ck-" + hashlib.sha256(tab.encode()).hexdigest()[:24] + ".txt")
-
-
 def remove_path(path, retry=True):
     """Remove app-owned temporary data, retrying paths that Windows still has open."""
     if not path:
@@ -139,33 +128,80 @@ def remove_path(path, retry=True):
                 PENDING_DELETE.add(path)
 
 
-def clear_yt_dlp_cookies(ydl):
-    """Drop yt-dlp's in-memory cookie jar as soon as its operation is done."""
-    if ydl is None:
+def scrub_text_stream(stream):
+    """Best-effort overwrite and close an in-memory cookie stream."""
+    if stream is None:
         return
-    jar = getattr(ydl, "cookiejar", None)
+    try:
+        stream.seek(0, os.SEEK_END)
+        length = stream.tell()
+        stream.seek(0)
+        if length:
+            stream.write("\0" * length)
+            stream.flush()
+        stream.seek(0)
+        stream.truncate(0)
+    except Exception:
+        pass
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+def clear_yt_dlp_cookies(ydl, opts=None):
+    """Clear yt-dlp's jar and scrub its per-operation, memory-only cookie stream."""
+    params = getattr(ydl, "params", {}) if ydl is not None else {}
+    stream = (opts or {}).get("cookiefile") or params.get("cookiefile")
+    jar = getattr(ydl, "cookiejar", None) if ydl is not None else None
     if jar is not None:
         try:
             jar.clear()
         except Exception:
             pass
+    scrub_text_stream(stream)
+    if isinstance(params, dict):
+        params["cookiefile"] = None
+        params["cookiesfrombrowser"] = None
+    if opts is not None:
+        opts.pop("cookiefile", None)
+        opts.pop("cookiesfrombrowser", None)
 
 
-def touch(tab):
+def erase_session_cookies(state):
+    """Zero the session's mutable cookie buffer and clear its public metadata."""
+    if not state:
+        return
+    secret = state.get("cookie_data")
+    if isinstance(secret, bytearray):
+        secret[:] = b"\0" * len(secret)
+    state["cookie_data"] = None
+    state.update(cookies=False, domains=[], count=0)
+    if state.get("method") == "file":
+        state["method"] = "none"
+
+
+def touch(tab, sid=""):
     """Mark a browser tab as active and return its private login settings."""
     if not tab:
         return None
     with SESS_LOCK:
         if tab in ENDED_TABS:
             return None
-        s = SESS.setdefault(tab, {"method": "none", "browser": "", "cookies": False, "domains": [], "count": 0})
+        s = SESS.setdefault(tab, {"method": "none", "browser": "", "cookies": False,
+                                  "cookie_data": None, "domains": [], "count": 0, "sid": sid})
+        if sid and s.get("sid") not in (None, sid):
+            return None
+        if sid:
+            s["sid"] = sid
         s["seen"], s["close_at"] = time.time(), 0
         return s
 
 
 def public_state(tab):
-    s = SESS.get(tab) or {}
-    return {k: s.get(k, d) for k, d in (("method", "none"), ("browser", ""), ("cookies", False), ("domains", []), ("count", 0))}
+    with SESS_LOCK:
+        s = SESS.get(tab) or {}
+        return {k: s.get(k, d) for k, d in (("method", "none"), ("browser", ""), ("cookies", False), ("domains", []), ("count", 0))}
 
 
 def wipe_tab(tab):
@@ -174,8 +210,26 @@ def wipe_tab(tab):
         return
     with SESS_LOCK:
         ENDED_TABS[tab] = time.time()
-        SESS.pop(tab, None)
+        state = SESS.pop(tab, None)
+        erase_session_cookies(state)
+    # Signal workers after the session is closed so no new work can adopt its credentials.
+    cancel_tab_activity(tab)
     purge_tab_data(tab)
+
+
+def wipe_sid(sid):
+    """Clear all page sessions opened by one authenticated browser session."""
+    if not sid:
+        return
+    now = time.time()
+    with SESS_LOCK:
+        tabs = [tab for tab, state in SESS.items() if state.get("sid") == sid]
+        for tab in tabs:
+            ENDED_TABS[tab] = now
+            erase_session_cookies(SESS.pop(tab, None))
+    for tab in tabs:
+        cancel_tab_activity(tab)
+        purge_tab_data(tab)
 
 
 def purge_tab_data(tab):
@@ -187,9 +241,22 @@ def purge_tab_data(tab):
                 entry["cancel"].set()
                 entry["record"].clear()
                 searches.pop(key, None)
-    remove_path(cookie_path(tab))
-    # Remove older diagnostic logs that might contain a URL from a prior version.
-    remove_path(LOG)
+
+
+def cancel_tab_activity(tab):
+    """Stop active work before replacing or forgetting this tab's login data."""
+    if "jobs" in globals():
+        with jobs.lock:
+            for job in jobs.items.values():
+                if job.get("tab") == tab and job.get("status") not in TERMINAL:
+                    job["cancel"].set()
+                    job["stop"].set()
+    with SEARCH_LOCK:
+        for key, entry in list(searches.items()):
+            if entry.get("tab") == tab:
+                entry["cancel"].set()
+                entry["record"].clear()
+                searches.pop(key, None)
 
 
 def expire_if_idle(tab, now):
@@ -202,7 +269,9 @@ def expire_if_idle(tab, now):
         if not (closing or idle):
             return
         ENDED_TABS[tab] = now
-        SESS.pop(tab, None)
+        state = SESS.pop(tab, None)
+        erase_session_cookies(state)
+    cancel_tab_activity(tab)
     purge_tab_data(tab)
 
 
@@ -218,6 +287,10 @@ def reaper():
             for tab, ended_at in list(ENDED_TABS.items()):
                 if now - ended_at > 86400:
                     ENDED_TABS.pop(tab, None)
+        with AUTH_LOCK:
+            for token, expires_at in list(AUTH_SESSIONS.items()):
+                if expires_at <= now:
+                    AUTH_SESSIONS.pop(token, None)
         with DELETE_LOCK:
             retrying = list(PENDING_DELETE)
             PENDING_DELETE.clear()
@@ -229,20 +302,23 @@ def apply_auth(opts, tab=""):
     """Use this tab's own login so it can reach content its account can already watch. Never shared between tabs."""
     if PROXY:
         opts["proxy"] = PROXY
-    s = SESS.get(tab)
-    if not s:
-        return opts
-    if s["method"] == "file" and s["cookies"] and os.path.isfile(cookie_path(tab)):
-        opts["cookiefile"] = cookie_path(tab)
-    elif s["method"] == "browser" and s["browser"] and not PUBLIC:
-        opts["cookiesfrombrowser"] = (s["browser"],)
+    with SESS_LOCK:
+        s = SESS.get(tab)
+        if not s:
+            return opts
+        secret = s.get("cookie_data")
+        if s.get("method") == "file" and isinstance(secret, bytearray) and secret:
+            # yt-dlp accepts a text stream as cookiefile; its normal write-back stays in RAM.
+            opts["cookiefile"] = io.StringIO(secret.decode("utf-8"))
+        elif s.get("method") == "browser" and s.get("browser") and not PUBLIC:
+            opts["cookiesfrombrowser"] = (s["browser"],)
     return opts
 
 
 def has_auth(tab):
     with SESS_LOCK:
         s = SESS.get(tab) or {}
-        return bool((s.get("method") == "file" and s.get("cookies") and os.path.isfile(cookie_path(tab)))
+        return bool((s.get("method") == "file" and s.get("cookies") and s.get("cookie_data"))
                     or (s.get("method") == "browser" and s.get("browser") and not PUBLIC))
 
 
@@ -273,14 +349,14 @@ def parse_cookies(txt):
     return "\n".join(lines).rstrip("\n") + "\n", n, sorted(doms, key=doms.get, reverse=True)[:6]
 
 
-def validate_cookie_file(path):
-    """Ask yt-dlp's own cookie loader to parse the normalized file before accepting it."""
+def validate_cookie_text(text):
+    """Validate a normalized cookie export in memory; never create a server-side file."""
     from yt_dlp.cookies import load_cookies
-    ydl, jar = None, None
+    ydl, jar, stream = None, None, io.StringIO(text)
     try:
-        ydl = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": Silent()})
+        ydl = yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": Silent(), "cachedir": False})
         with ydl:
-            jar = load_cookies(path, None, ydl)
+            jar = load_cookies(stream, None, ydl)
             return sum(1 for _ in jar)
     except Exception as e:
         raise ValueError("yt-dlp couldn't read this cookies.txt. Export it in Netscape format and try again.") from e
@@ -290,7 +366,7 @@ def validate_cookie_file(path):
                 jar.clear()
             except Exception:
                 pass
-        clear_yt_dlp_cookies(ydl)
+        clear_yt_dlp_cookies(ydl, {"cookiefile": stream})
 
 
 def test_browser_login(browser):
@@ -312,17 +388,29 @@ def test_browser_login(browser):
 
 
 def check_url(url):
-    """On shared servers, refuse links that point at private networks (SSRF protection)."""
+    """Reject unsafe URL forms and, on shared servers, non-public DNS answers."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Enter a valid website link.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Links containing usernames or passwords are not accepted.")
+    if PUBLIC and parsed.scheme.lower() != "https":
+        raise ValueError("Hosted downloads require an https:// link so login cookies are not sent over plain HTTP.")
     if not (PUBLIC or LAN):
         return
-    host = urlparse(url).hostname or ""
+    host = parsed.hostname
     try:
         infos = socket.getaddrinfo(host, None)
-    except OSError:
+    except (OSError, ValueError):
+        raise ValueError("Couldn't find that website. Check the link.")
+    if not infos:
         raise ValueError("Couldn't find that website. Check the link.")
     for i in infos:
-        ip = ipaddress.ip_address(i[4][0].split("%")[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+        try:
+            ip = ipaddress.ip_address(i[4][0].split("%")[0])
+        except ValueError:
+            raise ValueError("That website has an invalid network address.")
+        if not ip.is_global:
             raise ValueError("That address points to a private network and is blocked on this server.")
 
 
@@ -379,9 +467,10 @@ def friendly(e, tab=""):
     low = msg.lower()
     if any(term in low for term in ("netscape format", "failed to load cookies", "couldn't read cookies")):
         return "yt-dlp couldn't read the cookies.txt file. Export it again in Netscape format and try again.", "login"
-    s = SESS.get(tab) if tab else None
+    with SESS_LOCK:
+        s = dict(SESS.get(tab) or {}) if tab else {}
     auth_active = bool(s and (
-        (s.get("method") == "file" and s.get("cookies") and os.path.isfile(cookie_path(tab)))
+        (s.get("method") == "file" and s.get("cookies") and s.get("cookie_data"))
         or (s.get("method") == "browser" and s.get("browser") and not PUBLIC)))
     if auth_active and any(term in low for term in ("http error 401", "http error 403", "forbidden", "login required", "sign in", "not logged in")):
         return ("The site rejected access. Check that this browser or cookies.txt is signed in to this exact site, then refresh the login and try again. Some sites also block downloader access.", "login")
@@ -461,7 +550,7 @@ def build_options(job, d, staging):
         job["stages"] = 2 if FFMPEG else 1
     opts = {"format": selector, "outtmpl": os.path.join(staging, "%(title).120B [%(id)s].%(ext)s"),
             "windowsfilenames": True, "noplaylist": True, "quiet": True, "no_warnings": True, "logger": Silent(),
-            "retries": 3, "fragment_retries": 3, "continuedl": True,
+            "retries": 3, "fragment_retries": 3, "continuedl": True, "cachedir": False, "socket_timeout": 20,
             "concurrent_fragment_downloads": 8}   # fetch several stream fragments at once (HLS/DASH)
     if d.get("force_generic"):
         opts["force_generic_extractor"] = True
@@ -521,7 +610,9 @@ class Jobs:
         remove_path(j.get("staging"))
         j["staging"] = None
         j["files"].clear()
-        if isinstance(j.get("data"), dict):
+        # A worker may still be reading this dict. Its finally block clears it once
+        # cancellation has unwound; clearing it here can race yt-dlp option setup.
+        if j["status"] in TERMINAL and isinstance(j.get("data"), dict):
             j["data"].clear()
         j.update(title="", thumb="", label="", error="", message="Removed")
 
@@ -575,7 +666,7 @@ class Jobs:
 
     def run(self, job):
         d = job["data"]
-        staging = None
+        staging, opts, ydl = None, None, None
         try:
             with SLOTS:
                 def check():
@@ -609,7 +700,6 @@ class Jobs:
                 opts["progress_hooks"] = [on_progress]
                 opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=49.9))]
                 job.update(status="downloading", message="Connecting")
-                ydl = None
                 try:
                     ydl = yt_dlp.YoutubeDL(opts)
                     with ydl:
@@ -617,8 +707,6 @@ class Jobs:
                 except StopRec:
                     job.update(status="processing", message="Saving your recording", speed=None, eta=None)
                     salvage(staging)
-                finally:
-                    clear_yt_dlp_cookies(ydl)
                 check()
                 files = [(n, os.path.getsize(os.path.join(staging, n))) for n in sorted(os.listdir(staging))
                          if not n.endswith((".part", ".ytdl", ".temp", ".jpg", ".png", ".webp"))]
@@ -639,6 +727,8 @@ class Jobs:
                 msg, fix = friendly(e, job.get("tab", ""))
                 self.finish(job, "error", "Download failed", error=msg, fix=fix)
         finally:
+            # Covers setup failures and cancellations that happen before yt-dlp starts.
+            clear_yt_dlp_cookies(ydl, opts)
             # The original link/options are no longer needed after an attempt finishes.
             if isinstance(d, dict):
                 d.clear()
@@ -659,15 +749,17 @@ class SearchCancelled(Exception):
 def extract_with_auth(url, opts, tab=""):
     ydl = None
     try:
-        ydl = yt_dlp.YoutubeDL(apply_auth(opts, tab))
+        apply_auth(opts, tab)
+        ydl = yt_dlp.YoutubeDL(opts)
         with ydl:
             return ydl.extract_info(url, download=False)
     finally:
-        clear_yt_dlp_cookies(ydl)
+        clear_yt_dlp_cookies(ydl, opts)
 
 
 def do_search(rec, url, tab="", cancel=None):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": Live(rec, cancel), "noplaylist": True,
+            "cachedir": False, "socket_timeout": 20,
             "extract_flat": "in_playlist", "playlistend": 25 if PUBLIC else 200}
     if cancel and cancel.is_set():
         raise SearchCancelled()
@@ -759,10 +851,17 @@ class Handler(BaseHTTPRequestHandler):
         return c
 
     def authed(self):
-        if not AUTH_COOKIE:
-            return True
+        if not APP_PASSWORD:
+            return not PUBLIC
         m = self.cookies().get("sv_auth")
-        return bool(m) and hmac.compare_digest(m.value.encode(), AUTH_COOKIE.encode())
+        if not m:
+            return False
+        with AUTH_LOCK:
+            expires_at = AUTH_SESSIONS.get(m.value)
+            if expires_at is None or expires_at <= time.time():
+                AUTH_SESSIONS.pop(m.value, None)
+                return False
+            return True
 
     def sid(self):
         m = self.cookies().get("sv_sid")
@@ -793,45 +892,85 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.nocache()
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        if PUBLIC:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.end_headers()
         self.wfile.write(raw)
 
     def do_login(self):
         ip = self.client_ip()
-        n, t = FAILS.get(ip, (0, time.time()))
-        if time.time() - t > 900:
-            n, t = 0, time.time()
-        if n >= 8:
+        now = time.time()
+        with FAILS_LOCK:
+            n, t = FAILS.get(ip, (0, now))
+            if now - t > 900:
+                n, t = 0, now
+            limited = n >= 8
+            if not limited:
+                if ip not in FAILS and len(FAILS) >= 4096:
+                    for old_ip, (_, first_seen) in list(FAILS.items()):
+                        if now - first_seen > 900:
+                            FAILS.pop(old_ip, None)
+                    if len(FAILS) >= 4096:
+                        FAILS.pop(next(iter(FAILS)))
+                FAILS[ip] = (n + 1, t)
+        if limited:
             return self.send_html(LOGIN_HTML.replace("{{ERR}}", "Too many attempts. Try again in a few minutes."), 429)
-        length = min(int(self.headers.get("Content-Length", 0) or 0), 4096)
-        form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            return self.send_html(LOGIN_HTML.replace("{{ERR}}", "Invalid sign-in request."), 400)
+        if length < 0 or length > 4096:
+            return self.send_html(LOGIN_HTML.replace("{{ERR}}", "Sign-in request is too large."), 413)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            return self.send_html(LOGIN_HTML.replace("{{ERR}}", "Incomplete sign-in request."), 400)
+        try:
+            form = parse_qs(body.decode("utf-8", "replace"), max_num_fields=2)
+        except ValueError:
+            return self.send_html(LOGIN_HTML.replace("{{ERR}}", "Invalid sign-in request."), 400)
         pw = (form.get("password") or [""])[0]
-        if AUTH_COOKIE and hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
-            FAILS.pop(ip, None)
+        if APP_PASSWORD and hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+            with FAILS_LOCK:
+                FAILS.pop(ip, None)
+            auth_token = secrets.token_urlsafe(32)
+            with AUTH_LOCK:
+                AUTH_SESSIONS[auth_token] = time.time() + AUTH_COOKIE_TTL
             self.send_response(303)
             self.send_header("Location", "/")
-            self.send_header("Set-Cookie", f"sv_auth={AUTH_COOKIE}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000" + ("; Secure" if PUBLIC else ""))
+            self.send_header("Set-Cookie", f"sv_auth={auth_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={AUTH_COOKIE_TTL}" + ("; Secure" if PUBLIC else ""))
+            self.send_header("Cache-Control", "no-store")
+            if PUBLIC:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        FAILS[ip] = (n + 1, t)
         time.sleep(1)
         self.send_html(LOGIN_HTML.replace("{{ERR}}", "Wrong password."), 401)
 
-    def send_json(self, value, status=200):
+    def send_json(self, value, status=200, extra_headers=None):
         raw = json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.nocache()
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if PUBLIC:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        for name, header_value in (extra_headers or {}).items():
+            self.send_header(name, header_value)
         self.end_headers()
         self.wfile.write(raw)
 
     def guard(self, api):
-        if self.headers.get("Host") not in ALLOWED_HOSTS:
+        if (self.headers.get("Host") or "").lower() not in ALLOWED_HOSTS:
             raise PermissionError("Unexpected host.")
         origin = self.headers.get("Origin")
-        if origin and urlparse(origin).netloc not in ALLOWED_HOSTS:
+        if origin and urlparse(origin).netloc.lower() not in ALLOWED_HOSTS:
             raise PermissionError("Unexpected origin.")
         if api:
             if self.headers.get("X-Token") != TOKEN:
@@ -841,10 +980,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_json(self):
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            raw_length = self.headers.get("Content-Length", "0")
+            if not raw_length.isdigit():
+                raise ValueError("Invalid request size.")
+            n = int(raw_length)
             if n > 3_000_000:
                 raise ValueError("Request is too large.")
-            data = json.loads(self.rfile.read(n) or b"{}")
+            payload = self.rfile.read(n)
+            if len(payload) != n:
+                raise ValueError("Incomplete request.")
+            data = json.loads(payload or b"{}")
         except json.JSONDecodeError:
             raise ValueError("Invalid JSON.")
         if not isinstance(data, dict):
@@ -895,6 +1040,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(size))
                 self.nocache()
                 self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
+                if PUBLIC:
+                    self.send_header("Strict-Transport-Security", "max-age=31536000")
                 self.end_headers()
                 while True:
                     block = f.read(1 << 20)
@@ -960,7 +1107,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "Please sign in again (reload the page)."}, 401)
             if path.startswith("/api/") and path not in ("/api/session/leave", "/api/session/end"):
                 tab = self.tab()
-                if not tab or touch(tab) is None:
+                if not tab or touch(tab, self.sid()) is None:
                     return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
             if method == "GET":
                 if path == "/":
@@ -968,7 +1115,8 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_html(LOGIN_HTML.replace("{{ERR}}", ""))
                     # Ctrl+Shift+R marks this document to expire its previous tab session.
                     hard = "no-cache" in (self.headers.get("Cache-Control", "") + self.headers.get("Pragma", "")).lower()
-                    page = open(os.path.join(HERE, "index.html"), encoding="utf-8").read().replace("{{TOKEN}}", TOKEN).replace("{{FRESH}}", "1" if hard else "0")
+                    nonce = secrets.token_urlsafe(18)
+                    page = open(os.path.join(HERE, "index.html"), encoding="utf-8").read().replace("{{TOKEN}}", TOKEN).replace("{{FRESH}}", "1" if hard else "0").replace("{{NONCE}}", nonce)
                     raw = page.encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -977,7 +1125,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("X-Frame-Options", "DENY")
                     self.send_header("X-Content-Type-Options", "nosniff")
                     self.send_header("Referrer-Policy", "no-referrer")
-                    self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+                    self.send_header("Content-Security-Policy", f"default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'nonce-{nonce}' 'strict-dynamic'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+                    self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
                     if "sv_sid" not in self.cookies():
                         self.send_header("Set-Cookie", f"sv_sid={secrets.token_urlsafe(16)}; Path=/; HttpOnly; SameSite=Lax" + ("; Secure" if PUBLIC else ""))
                     self.end_headers()
@@ -988,7 +1137,7 @@ class Handler(BaseHTTPRequestHandler):
                     cur, new = yt_dlp.version.__version__, LATEST["v"]
                     return self.send_json({"ytdlp": cur, "latest": new, "update": bool(new and not PUBLIC and vtuple(new) > vtuple(cur)),
                                            "ffmpeg": bool(FFMPEG), "public": PUBLIC, "can_browser": not PUBLIC and self.is_local(),
-                                           "can_cookies": not PUBLIC or bool(APP_PASSWORD), **public_state(self.tab())})
+                                           "can_cookies": (bool(APP_PASSWORD) if PUBLIC else (not LAN or self.is_local())), **public_state(self.tab())})
                 if path == "/api/ping":
                     return self.send_json({"ok": True})
                 if path == "/api/jobs":
@@ -1033,54 +1182,102 @@ class Handler(BaseHTTPRequestHandler):
                 tab = self.tab()
                 if not tab:
                     raise ValueError("Reload the page and try again.")
-                st = touch(tab)
+                st = touch(tab, self.sid())
                 if not st:
                     return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
+                m = data.get("method")
+                if m is not None and m not in ("none", "browser", "file"):
+                    raise ValueError("Invalid login method.")
+                requested_browser = str(data.get("browser", st.get("browser", ""))).lower()
+                if m == "browser" and not requested_browser:
+                    raise ValueError("Choose a browser first.")
+                if m == "file" and not (data.get("cookies_text") or st.get("cookies")):
+                    raise ValueError("Upload a cookies.txt file first.")
+                auth_changed = bool(data.get("cookies_text") or data.get("clear_cookies") or m is not None or "browser" in data)
                 if "browser" in data:
                     br = str(data["browser"]).lower()
                     if br and br not in BROWSERS:
                         raise ValueError("Unsupported browser.")
                     if br and (PUBLIC or not self.is_local()):
                         raise PermissionError("Reading a browser login only works on the computer running this app. Use a cookies.txt file instead.")
-                    st["browser"] = br
-                if data.get("clear_cookies"):
-                    remove_path(cookie_path(tab))
-                    st.update(cookies=False, domains=[], count=0)
-                    if st["method"] == "file":
-                        st["method"] = "none"
+                    with SESS_LOCK:
+                        if tab in ENDED_TABS or SESS.get(tab) is not st:
+                            raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
+                        st["browser"] = br
                 txt = data.get("cookies_text")
                 if txt:
+                    if LAN and not self.is_local():
+                        raise PermissionError("Cookie import is disabled from other devices in LAN mode because this app does not provide HTTPS there.")
                     if PUBLIC and not APP_PASSWORD:
                         raise PermissionError("Cookie upload stays off until the server owner sets an APP_PASSWORD.")
                     normalized, n, top = parse_cookies(str(txt))
-                    os.makedirs(WORK, exist_ok=True)
-                    fd, tmp_path = tempfile.mkstemp(prefix="cookie-", suffix=".txt", dir=WORK)
-                    try:
-                        # newline=None writes CRLF on Windows, which yt-dlp's Netscape
-                        # cookie loader expects, while retaining LF on Unix-like systems.
-                        with os.fdopen(fd, "w", encoding="utf-8") as f:
-                            f.write(normalized)
-                        parsed_count = validate_cookie_file(tmp_path)
-                        if not parsed_count:
-                            raise ValueError("No usable cookies were found. Export a fresh cookies.txt and try again.")
-                        with SESS_LOCK:
-                            if tab in ENDED_TABS or SESS.get(tab) is not st:
-                                raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
-                            os.replace(tmp_path, cookie_path(tab))
-                            st.update(cookies=True, domains=top, count=parsed_count, method="file")
-                    finally:
-                        if os.path.exists(tmp_path):
-                            remove_path(tmp_path)
-                m = data.get("method")
+                    parsed_count = validate_cookie_text(normalized)
+                    if not parsed_count:
+                        raise ValueError("No usable cookies were found. Export a fresh cookies.txt and try again.")
+                    secret = bytearray(normalized.encode("utf-8"))
+                    normalized = ""
+                    data["cookies_text"] = ""
+                    cancel_tab_activity(tab)
+                    with SESS_LOCK:
+                        if tab in ENDED_TABS or SESS.get(tab) is not st:
+                            secret[:] = b"\0" * len(secret)
+                            raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
+                        erase_session_cookies(st)
+                        st.update(cookie_data=secret, cookies=True, domains=top, count=parsed_count, method="file")
+                    txt = ""
+                if data.get("clear_cookies"):
+                    cancel_tab_activity(tab)
+                    with SESS_LOCK:
+                        if SESS.get(tab) is st:
+                            erase_session_cookies(st)
                 if m in ("none", "browser", "file"):
                     if m == "browser" and not st["browser"]:
                         raise ValueError("Choose a browser first.")
                     if m == "file" and not st["cookies"]:
                         raise ValueError("Upload a cookies.txt file first.")
-                    st["method"] = m
+                    if m == "none":
+                        cancel_tab_activity(tab)
+                        with SESS_LOCK:
+                            if SESS.get(tab) is st:
+                                erase_session_cookies(st)
+                                st["method"] = "none"
+                    elif m == "browser":
+                        if st.get("method") != "browser":
+                            cancel_tab_activity(tab)
+                            with SESS_LOCK:
+                                if SESS.get(tab) is st:
+                                    erase_session_cookies(st)
+                                    st["method"] = "browser"
+                    else:
+                        with SESS_LOCK:
+                            if SESS.get(tab) is st:
+                                st["method"] = "file"
                 elif "browser" in data:
-                    st["method"] = "browser" if st["browser"] else ("none" if st["method"] == "browser" else st["method"])
+                    if st["browser"] and st.get("method") != "browser":
+                        cancel_tab_activity(tab)
+                        with SESS_LOCK:
+                            if SESS.get(tab) is st:
+                                erase_session_cookies(st)
+                                st["method"] = "browser"
+                    elif not st["browser"] and st.get("method") == "browser":
+                        cancel_tab_activity(tab)
+                        with SESS_LOCK:
+                            if SESS.get(tab) is st:
+                                erase_session_cookies(st)
+                                st["method"] = "none"
+                if auth_changed:
+                    # Catch any work that began between the first cancellation and
+                    # the atomic credential replacement/removal above.
+                    cancel_tab_activity(tab)
                 return self.send_json(public_state(tab))
+            if path == "/api/logout":
+                auth = self.cookies().get("sv_auth")
+                if auth:
+                    with AUTH_LOCK:
+                        AUTH_SESSIONS.pop(auth.value, None)
+                wipe_sid(self.sid())
+                expired = "sv_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + ("; Secure" if PUBLIC else "")
+                return self.send_json({"ok": True}, extra_headers={"Set-Cookie": expired})
             if path == "/api/login/test":
                 br = (SESS.get(self.tab()) or {}).get("browser")
                 if not br:
@@ -1093,11 +1290,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/session/leave":
                 with SESS_LOCK:
                     st = SESS.get(self.tab())
-                    if st and self.tab() not in ENDED_TABS:
+                    if st and st.get("sid") == self.sid() and self.tab() not in ENDED_TABS:
                         st["close_at"] = time.time() + 12
                 return self.send_json({"ok": True})
             if path == "/api/session/end":
-                wipe_tab(self.tab())
+                with SESS_LOCK:
+                    st = SESS.get(self.tab())
+                    owned = bool(st and st.get("sid") == self.sid())
+                if owned:
+                    wipe_tab(self.tab())
                 return self.send_json({"ok": True})
             if path.startswith("/api/stop/"):
                 ok = jobs.stop(path.rsplit("/", 1)[-1], self.owner())
@@ -1132,6 +1333,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if PUBLIC and len(APP_PASSWORD) < 16:
+        fatal("Hosted mode requires APP_PASSWORD to be set to a strong value of at least 16 characters. Add it in Render Environment settings, then redeploy.")
     server, port = None, 0
     ports = [int(os.environ["PORT"])] if (PUBLIC and os.environ.get("PORT")) else range(8765, 8785)
     for port in ports:
@@ -1154,7 +1357,6 @@ def main():
         lan_ip, extra = lan_hosts(port)
         ALLOWED_HOSTS.update(extra)
     shutil.rmtree(WORK, ignore_errors=True)
-    remove_path(LOG)
     threading.Thread(target=check_latest, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
     print(f"Stypzy Video running at http://127.0.0.1:{port}  (FFmpeg: {'yes' if FFMPEG else 'no'}, aria2c: {'yes' if ARIA2 else 'no'})", flush=True)
