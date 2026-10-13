@@ -152,15 +152,156 @@ label.btn{display:inline-block}
 @media(max-width:820px){.result{grid-template-columns:1fr}.info{position:static}.steps .step span{display:none}h1{margin-top:40px}}
 @media(max-width:560px){.search{flex-direction:column}.job{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* Refined Stypzy visual system */
+:root{
+  --bg:#090b12;--glass:#111521d9;--glass2:#ffffff0b;--line:#ffffff16;
+  --text:#f6f7fb;--mute:#a2a9ba;--v:#9c7bff;--c:#6de0df;
+  --grad:linear-gradient(115deg,#a581ff 0%,#6b91ff 52%,#65ded8 100%)
+}
+body{
+  background:radial-gradient(ellipse at 50% -18%,#252044 0,transparent 48%),
+             radial-gradient(ellipse at 100% 45%,#102c36 0,transparent 34%),var(--bg);
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  letter-spacing:.005em
+}
+.aurora i{opacity:.16;filter:blur(110px)}
+.wrap{max-width:1160px;padding:24px 28px 96px}
+nav{min-height:58px;padding:10px 12px 10px 14px;border:1px solid #ffffff12;border-radius:18px;background:#0e111bd1;backdrop-filter:blur(20px);box-shadow:0 10px 35px #0003}
+.brand{gap:12px;font-size:17px;letter-spacing:-.025em}
+.brand .logo{width:38px;height:38px;border-radius:12px;box-shadow:0 5px 22px #8b5cf64a}
+.pills{align-items:center;gap:9px}
+.pill{padding:7px 12px;background:#ffffff07;border-color:#ffffff12;color:#bec4d2;font-size:12px}
+button.pill{transition:background .18s,border-color .18s,color .18s,transform .18s}
+button.pill:hover{background:#ffffff0d;border-color:#ffffff28;color:var(--text);transform:translateY(-1px)}
+h1{font-size:clamp(46px,7vw,76px);line-height:.99;letter-spacing:-.065em;margin:58px 0 18px;max-width:14ch}
+.hero-accent{background:var(--grad);background-clip:text;-webkit-background-clip:text;color:transparent}
+.lead{max-width:58ch;font-size:16px;line-height:1.75;color:#aeb5c5;margin-bottom:27px}
+.search{gap:10px;padding:9px;border-radius:18px;background:#111521ed;border-color:#ffffff20;box-shadow:0 20px 60px #0005,0 0 0 1px #ffffff04 inset;backdrop-filter:blur(22px)}
+.search::before{opacity:.3}
+.search input{padding:15px 17px;font-size:15px}
+.search input::placeholder{color:#7e8799}
+.btn{border-radius:12px;transition:transform .16s,box-shadow .2s,background .2s,border-color .2s,opacity .2s}
+.btn:hover:not(:disabled){transform:translateY(-1px)}
+.btn.go{background:linear-gradient(115deg,#8969f5,#617de9 58%,#48bcb9);box-shadow:0 8px 24px #5e66dc35;color:#fff}
+.btn.go:hover:not(:disabled){box-shadow:0 12px 30px #5e82ee55}
+.btn.soft{background:#ffffff08;border-color:#ffffff18;color:#dce1eb}
+.btn.soft:hover:not(:disabled){background:#ffffff11;border-color:#ffffff32}
+.btn.bad{background:#fb718510;border-color:#fb71852e}
+.hero-kicker{display:flex;align-items:center;gap:9px;color:#c4b6ff;font-size:11px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}
+.hero-kicker::before{content:"";width:7px;height:7px;border-radius:50%;background:#9a7aff;box-shadow:0 0 14px #9a7aff}
+.search-caption{display:flex;justify-content:space-between;align-items:center;margin:0 2px 9px;color:#8f98aa;font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase}
+.search-caption span:last-child{font-size:12px;font-weight:500;letter-spacing:0;text-transform:none;color:#8791a3}
+.how-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0 0}
+.how-card{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid #ffffff0e;border-radius:15px;background:#ffffff04;color:#bac1ce;font-size:13px}
+.how-card b{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#9c7bff16;color:#c5b4ff;font-size:11px;letter-spacing:.04em}
+.status{margin-top:22px;padding:22px 24px;background:#111521ed;border-color:#ffffff17}
+.result{grid-template-columns:minmax(240px,310px) minmax(0,1fr);gap:18px;margin-top:22px}
+.glass{background:linear-gradient(145deg,#141a27e8,#10141fe8);border-color:#ffffff14;box-shadow:0 22px 60px #0004}
+.info,.panel{border-radius:20px;padding:18px}
+.thumb{border-radius:14px}
+.title{font-size:18px;letter-spacing:-.02em}
+.tabs{padding:4px;background:#090d16;border-color:#ffffff12}
+.tabs button{padding:9px 20px;border-radius:10px}
+.tabs button[aria-selected=true]{background:linear-gradient(115deg,#8767e9,#587edf);box-shadow:0 5px 16px #6678df36}
+.chip{background:#ffffff06;border-color:#ffffff14;color:#c2c8d4}
+.chip:hover{background:#ffffff0c}
+.chip[aria-pressed=true]{background:linear-gradient(115deg,#8767e9,#587edf);box-shadow:0 5px 16px #6678df30}
+.scroll{border-color:#ffffff14;background:#0c1018a8}
+th{background:#111723;color:#aeb6c6}
+th,td{border-bottom-color:#ffffff0c}
+tbody tr:hover{background:#ffffff08}
+tbody tr[aria-selected=true]{background:#8b72ef20;box-shadow:inset 3px 0 #a78bfa}
+.tag{background:#ffffff0a;color:#bfc7d4}
+.tag.y{background:#4ade8015;color:#87e4a1}
+select{background:#0c111b;border-color:#ffffff1c}
+.cta{border-top-color:#ffffff12}
+.qhead{margin-top:42px;margin-bottom:12px}
+.qhead h2{font-size:21px;letter-spacing:-.035em}
+.job{gap:16px;padding:17px 18px;border-radius:18px;background:linear-gradient(130deg,#141a26e8,#10141de8);border-color:#ffffff12;box-shadow:0 12px 32px #0002;transition:transform .18s,border-color .18s,background .18s}
+.job:hover{transform:translateY(-1px);border-color:#ffffff26;background:linear-gradient(130deg,#171e2ce8,#121824e8)}
+.ring{width:56px;height:56px}
+.ring svg{width:56px;height:56px}
+.ring circle{stroke-width:5}
+.ring span{font-size:12px}
+.jt{letter-spacing:-.01em}
+.stats{gap:10px 16px;color:#929bad}
+.badge{background:#ffffff0b;color:#adb6c7}
+.empty{padding:34px 20px;background:#ffffff03;border-color:#ffffff15;color:#a6afc0}
+.scrim{background:#05070bc9;backdrop-filter:blur(8px)}
+.drawer{background:linear-gradient(180deg,#151a29 0%,#0c1019 100%);border-left-color:#ffffff16}
+.sec{background:#ffffff05;border-color:#ffffff12}
+.mo{background:#ffffff04;border-color:#ffffff12}
+.mo[aria-checked=true]{background:linear-gradient(110deg,#8b5cf61b,#22d3ee0b);border-color:#8b7af1a6}
+.ddb{background:#0c111b;border-color:#ffffff18}
+.ddl{background:#151a28f5;border-color:#ffffff19}
+.banner{background:#fb718512;border-color:#fb71852a}
+#offline{background:#fb718512}
+@media(max-width:760px){
+  .wrap{padding:16px 16px 72px}
+  nav{align-items:flex-start}
+  .result{grid-template-columns:1fr}
+  .info{position:static;display:grid;grid-template-columns:minmax(110px,180px) 1fr;gap:0 16px;align-items:center}
+  .thumb{grid-row:span 2}
+  .title{margin-top:0}
+  .how-strip{gap:8px}
+  .how-card{padding:11px 10px;gap:8px;font-size:12px}
+}
+@media(max-width:560px){
+  .wrap{padding:12px 12px 56px}
+  nav{padding:9px 10px}
+  .brand{font-size:15px}
+  .brand .logo{width:34px;height:34px}
+  .pills{gap:6px}
+  .pills .pill{padding:6px 8px;font-size:11px}
+  h1{font-size:clamp(42px,13vw,60px);margin:46px 0 14px}
+  .lead{font-size:14px;margin-bottom:22px}
+  .search-caption span:last-child{display:none}
+  .search{flex-direction:row;flex-wrap:wrap}
+  .search input{flex-basis:100%;padding:13px 12px}
+  .search .btn{flex:1;padding:10px 12px}
+  .how-strip{grid-template-columns:1fr;gap:7px;margin-top:12px}
+  .how-card{padding:9px 11px}
+  .status{padding:17px 15px}
+  .result{gap:12px}
+  .info,.panel{padding:14px;border-radius:17px}
+  .info{grid-template-columns:100px 1fr;gap:0 12px}
+  .qhead{margin-top:32px}
+  .job{padding:13px;gap:12px}
+  .ring,.ring svg{width:48px;height:48px}
+  .acts{width:100%}
+  .job>.acts{justify-content:flex-end}
+}
+nav{
+  position:sticky;top:12px;z-index:30;isolation:isolate;overflow:hidden;
+  min-height:62px;padding:10px 14px 10px 15px;border:1px solid transparent;border-radius:20px;
+  background:linear-gradient(115deg,#171b2aeF,#111725ed 58%,#101b23ed) padding-box,
+             linear-gradient(110deg,#a78bfa70,#ffffff20 42%,#6de0df54) border-box;
+  box-shadow:0 18px 48px #0005,inset 0 1px #ffffff12,0 0 36px #7d73d00d;
+  backdrop-filter:blur(24px)
+}
+nav::after{content:"";position:absolute;z-index:-1;pointer-events:none;top:0;left:8%;right:8%;height:1px;background:linear-gradient(90deg,transparent,#d8ccff55 25%,#ffffff28 55%,#9af2eb38 78%,transparent)}
+.brand .logo{border:1px solid #ffffff31;box-shadow:0 6px 22px #8b5cf65a,inset 0 1px #ffffff55}
+.pills .pill{background:#ffffff08;border-color:#ffffff17;box-shadow:inset 0 1px #ffffff08}
+.pills button.pill{background:linear-gradient(120deg,#a78bfa19,#6de0df0c);border-color:#a78bfa40;color:#e6e1ff}
+.pills button.pill:hover{background:linear-gradient(120deg,#a78bfa2e,#6de0df18);border-color:#b9a7ff75;box-shadow:0 4px 16px #7867d425}
+.hero{max-width:780px;margin:22px 0 32px}
+.hero-kicker{width:max-content;padding:7px 11px;border:1px solid #a78bfa35;border-radius:999px;background:#9c7bff0d;letter-spacing:.13em}
+.hero h1{margin:18px 0 17px}
+.hero .lead{margin-bottom:0}
+.search-caption{margin-top:28px}
+@media(max-width:760px){.hero{margin-top:18px}}
+@media(max-width:560px){nav{top:8px;min-height:56px;padding:8px 9px;border-radius:16px}.hero{margin:14px 0 24px}.hero h1{margin:15px 0 14px}.search-caption{margin-top:20px}}
 </style>
 </head>
 <body>
 <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
-<main class="wrap">
-<nav><div class="brand"><span class="logo">&#9654;</span>Stypzy Video</div>
+<main class="wrap" id="app">
+<nav><div class="brand"><span class="logo" aria-hidden="true">&#9654;</span><span>Stypzy Video</span></div>
 <div class="pills"><span class="pill" id="pFf">Checking FFmpeg</span><span class="pill" id="pYt">yt-dlp</span><button class="pill" id="pSet" type="button" aria-expanded="false">Login and updates</button></div></nav>
-<h1>Any video. Or just the audio.</h1>
-<p class="lead">Paste a link, pick a quality, and the file lands in your browser's Downloads like any other. Convert to MP3 when you only want the sound.</p>
+<section class="hero"><div class="hero-kicker">A simpler way to save</div>
+<h1>Video saving,<br><span class="hero-accent">made simple.</span></h1>
+<p class="lead">Paste a link from a supported site, choose a format, and save it through your browser. Site access and DRM restrictions apply.</p></section>
 <div class="banner hidden" id="fixBar"><span id="fixMsg"></span><button class="btn soft sm" id="fixBtn" type="button">Open settings</button></div>
 <div class="banner hidden" id="offline">Lost connection to the app. Make sure server.py is still running, then reload.</div>
 
@@ -202,10 +343,12 @@ label.btn{display:inline-block}
     <div class="acts" style="margin-top:12px"><button class="btn go sm" id="upd" type="button">Update yt-dlp</button></div>
     <p class="hint" id="uMsg"></p>
   </section>
-  <p class="priv">Uploaded cookies are kept in server memory, not saved as a cookie file. Closing this tab, signing out, or removing cookies cancels its active work and clears app-held copies when each request stops. Browser login uses yt-dlp's reader, which can make a temporary database copy in the operating system's temp folder; normal cleanup removes it, but no app can promise forensic erasure from RAM, swap, or SSD storage. The server operator can access cookies while they are in use. Your browser login and original cookies.txt file remain; downloaded video files are separate.</p>
+  <p class="priv">Uploaded cookies are kept in server memory, not saved as a cookie file. Closing this tab, signing out, or removing cookies requests cleanup and cancels its active work. If the close signal is missed, abandoned sessions are cleared after a short inactivity period. Browser login uses yt-dlp's reader, which may make a temporary database copy. Temporary data is removed normally, but RAM, swap, and SSD storage cannot be forensically erased by an app. The server operator can access cookies while they are in use. Your browser login and original cookies.txt file remain; downloaded video files are separate.</p>
 </aside>
-<div class="glass search"><input id="url" type="url" placeholder="Paste a video or playlist link" aria-label="Video link" autofocus>
+<div class="search-caption"><span>Video or playlist link</span><span>Use a link from a supported site</span></div>
+<div class="glass search"><input id="url" type="url" placeholder="Paste your link here" aria-label="Video link" autofocus>
 <button class="btn soft" id="paste" type="button">Paste</button><button class="btn go" id="find" type="button">Find formats</button></div>
+<div class="how-strip" aria-label="How it works"><div class="how-card"><b>01</b><span>Paste a video or playlist link</span></div><div class="how-card"><b>02</b><span>Choose a format and quality</span></div><div class="how-card"><b>03</b><span>Save through your browser</span></div></div>
 
 <section class="glass status hidden" id="status" aria-live="polite">
 <div class="steps"><div class="step" data-at="5"><b>1</b><span>Connect</span></div><div class="step" data-at="25"><b>2</b><span>Read page</span></div>
@@ -281,11 +424,27 @@ function paintInfo(){
   $("#upd").classList.toggle("hidden",pub);$("#uMsg").textContent=pub?"":"After updating, stop and start server.py once to use the new version."}
 async function init(){S.info=await api("/api/info");ME=await detectMe();pick=S.info.method;paintInfo();poll();
   setTimeout(()=>api("/api/ping").catch(()=>{}),3000);setInterval(()=>api("/api/ping").catch(()=>{}),60000)}
-function openSet(o){$("#settings").classList.toggle("open",o);$("#scrim").classList.toggle("open",o);$d.body.classList.toggle("lock",o);$("#pSet").setAttribute("aria-expanded",o);if(o)$("#sClose").focus()}
+let settingsReturnFocus=null;
+function openSet(o){
+  const wasOpen=$("#settings").classList.contains("open");
+  if(o&&!wasOpen)settingsReturnFocus=$d.activeElement;
+  $("#settings").classList.toggle("open",o);$("#scrim").classList.toggle("open",o);$d.body.classList.toggle("lock",o);
+  [...$("#app").children].forEach(node=>{if(node.id!=="settings"&&node.id!=="scrim")node.inert=o});$("#pSet").setAttribute("aria-expanded",o);
+  if(o)$("#sClose").focus();else if(wasOpen&&settingsReturnFocus?.isConnected){settingsReturnFocus.focus();settingsReturnFocus=null}
+}
 $("#pSet").onclick=()=>openSet(true);$("#sClose").onclick=()=>openSet(false);$("#scrim").onclick=()=>openSet(false);
 $("#logout").onclick=async()=>{const b=$("#logout");b.disabled=true;try{await api("/api/logout",{});location.reload()}catch(e){toast(e.message,1);b.disabled=false}};
 $("#pYt").onclick=()=>{if(S.info.update)openSet(true)};$("#fixBtn").onclick=()=>openSet(true);
-$d.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("#settings").classList.contains("open"))openSet(false)});
+$d.addEventListener("keydown",e=>{
+  if(!$("#settings").classList.contains("open"))return;
+  if(e.key==="Escape"){openSet(false);return}
+  if(e.key!=="Tab")return;
+  const focusable=[...$("#settings").querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),[tabindex="0"]')].filter(x=>x.getClientRects().length);
+  if(!focusable.length)return;
+  const first=focusable[0],last=focusable[focusable.length-1];
+  if(e.shiftKey&&$d.activeElement===first){e.preventDefault();last.focus()}
+  else if(!e.shiftKey&&$d.activeElement===last){e.preventDefault();first.focus()}
+});
 async function saveSettings(p,msg){try{Object.assign(S.info,await api("/api/settings",p));paintInfo();if(msg)toast(msg)}catch(e){toast(e.message,1);paintInfo()}}
 $d.querySelectorAll(".mo .opt").forEach(o=>{const k=o.parentElement.dataset.m;
   const go=async()=>{
@@ -390,7 +549,7 @@ $("#clear").onclick=async()=>{await api("/api/clear",{});poll()};
 function ring(p,txt){const C=2*Math.PI*26,off=C*(1-(p==null?.28:p/100));
   const w=el("div","ring");w.innerHTML=`<svg width="64" height="64" viewBox="0 0 64 64"><circle class="bg" cx="32" cy="32" r="26"/><circle class="fg" cx="32" cy="32" r="26" stroke-dasharray="${C}" stroke-dashoffset="${off}"/></svg>`;
   w.append(el("span",0,txt));return w}
-const NAMES={queued:"Queued",downloading:"Downloading from site",processing:"Preparing file",ready:"Ready to send",sending:"Sending to browser",completed:"Saved to browser",error:"Failed",cancelled:"Cancelled"};
+const NAMES={queued:"Queued",downloading:"Downloading from site",processing:"Preparing file",ready:"Ready to send",sending:"Sending to browser",completed:"Sent to browser",error:"Failed",cancelled:"Cancelled"};
 function save(f,jid){if(jid)PENDING.set(jid,Date.now());const a=el("a");a.href=f.url;a.download=f.name;$d.body.append(a);a.click();a.remove();if(jid)setTimeout(poll,100)}
 function card(j){
   if(j.status==="sending"||j.status==="completed")PENDING.delete(j.id);
@@ -429,11 +588,11 @@ async function poll(){
 function dd(sel){
   sel.classList.add("hidden");
   const w=el("div","dd"),b=el("button","ddb"),l=el("ul","ddl hidden");
-  b.type="button";b.setAttribute("aria-haspopup","listbox");l.setAttribute("role","listbox");
+  b.type="button";b.setAttribute("aria-haspopup","listbox");b.setAttribute("aria-expanded","false");b.setAttribute("aria-controls",sel.id+"-listbox");l.id=sel.id+"-listbox";l.setAttribute("role","listbox");
   const items=[...sel.options].map(o=>{const li=el("li",0,o.textContent);li.dataset.v=o.value;li.tabIndex=-1;li.setAttribute("role","option");l.append(li);return li});
   const mark=()=>items.forEach(li=>{const on=li.dataset.v===sel.value;li.setAttribute("aria-selected",on);if(on)b.textContent=li.textContent});
-  const close=()=>{l.classList.add("hidden");w.classList.remove("open")};
-  const open=()=>{l.classList.remove("hidden");w.classList.add("open");(items.find(i=>i.dataset.v===sel.value)||items[0]).focus()};
+  const close=()=>{l.classList.add("hidden");w.classList.remove("open");b.setAttribute("aria-expanded","false")};
+  const open=()=>{l.classList.remove("hidden");w.classList.add("open");b.setAttribute("aria-expanded","true");(items.find(i=>i.dataset.v===sel.value)||items[0]).focus()};
   const pick=li=>{sel.value=li.dataset.v;mark();close();b.focus();sel.dispatchEvent(new Event("change"))};
   b.onclick=()=>l.classList.contains("hidden")?open():close();
   items.forEach((li,i)=>{li.onclick=()=>pick(li);li.onkeydown=e=>{

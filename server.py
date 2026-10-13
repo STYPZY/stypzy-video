@@ -1,6 +1,6 @@
 """Stypzy Video v2 - run: python server.py   (needs: python -m pip install -U yt-dlp)
 Files are prepared in a temp folder, then streamed to the browser's download flow."""
-import atexit, hmac, ipaddress, io, json, os, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
+import atexit, concurrent.futures, hmac, ipaddress, io, json, os, queue, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, traceback, urllib.request, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote, parse_qs
 from http.cookies import SimpleCookie
@@ -40,7 +40,7 @@ except ImportError:
     fatal("yt-dlp is required for the Python you are running:\n  " + sys.executable +
           "\nInstall it with:\n  \"" + sys.executable + "\" -m pip install -U yt-dlp")
 
-WORK = os.path.join(tempfile.gettempdir(), "stypzy-video")
+WORK = os.path.join(tempfile.gettempdir(), f"stypzy-video-{os.getpid()}-{secrets.token_hex(6)}")
 TOKEN = secrets.token_urlsafe(24)
 FFMPEG = shutil.which("ffmpeg") or (
     os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe") if os.name == "nt" else None)
@@ -63,8 +63,10 @@ ARIA2 = None if os.environ.get("STYPZY_NO_ARIA") else (shutil.which("aria2c") or
     os.path.join(os.path.dirname(sys.executable), "aria2c.exe") if os.name == "nt" else None))
 if ARIA2 and not os.path.isfile(ARIA2):
     ARIA2 = None
-SLOTS, ALLOWED_HOSTS, TERMINAL = threading.Semaphore(2), set(), ("ready", "completed", "cancelled", "error")
+ALLOWED_HOSTS, TERMINAL = set(), ("ready", "completed", "cancelled", "error")
 TTL = 1800  # seconds a finished file stays available
+DOWNLOAD_WORKERS = 1 if (os.environ.get("RENDER") or os.environ.get("STYPZY_PUBLIC")) else 2
+SEARCH_WORKERS = 4
 BROWSERS = ("chrome", "edge", "firefox", "brave", "opera", "chromium")
 LATEST, SESS, SESS_LOCK = {"v": None}, {}, threading.Lock()   # per-tab login settings
 ENDED_TABS, SEARCH_LOCK = {}, threading.Lock()
@@ -72,19 +74,46 @@ PENDING_DELETE, DELETE_LOCK = set(), threading.Lock()
 LAN = "--lan" in sys.argv     # opt-in: let other devices on your network use this server
 LOCAL_ONLY = ("/api/update", "/api/login/test")   # only the computer running the app may use these
 
-# Hosted mode (Render sets RENDER=true; or set STYPZY_PUBLIC=1): password-protected, with limits.
+# Hosted mode (Render sets RENDER=true; or set STYPZY_PUBLIC=1): password-protected.
 PUBLIC = bool(os.environ.get("RENDER") or os.environ.get("STYPZY_PUBLIC"))
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PROXY = os.environ.get("YTDLP_PROXY", "")                                  # optional: route yt-dlp through a proxy
 AUTH_COOKIE_TTL = 86400                                                       # require hosted users to reauthenticate daily
-MAX_MB = int(os.environ.get("MAX_MB", "400")) if PUBLIC else 0              # largest file a visitor may fetch
-MAX_ACTIVE = int(os.environ.get("MAX_ACTIVE", "2")) if PUBLIC else 99       # active downloads per visitor
 if PUBLIC:
-    SLOTS = threading.Semaphore(int(os.environ.get("MAX_JOBS", "1")))       # free instances are tiny: 1 at a time
     TTL = 900
 FAILS, FAILS_LOCK = {}, threading.Lock()   # ip -> (login attempts, first attempt time)
 AUTH_SESSIONS, AUTH_LOCK = {}, threading.Lock()  # random bearer token -> expiry time
-IDLE = 900 if PUBLIC else 300      # fallback cleanup if the browser cannot notify us that its tab closed
+IDLE = 120 if PUBLIC else 300      # fallback cleanup if the browser cannot notify us that its tab closed
+
+
+_SYSTEM_GETADDRINFO = socket.getaddrinfo
+
+
+class UnsafeNetworkAddress(Exception):
+    pass
+
+
+def public_getaddrinfo(host, port, *args, **kwargs):
+    """Reject private destinations at every Python socket DNS lookup in hosted mode."""
+    answers = _SYSTEM_GETADDRINFO(host, port, *args, **kwargs)
+    for answer in answers:
+        try:
+            address = ipaddress.ip_address(answer[4][0].split("%", 1)[0])
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+        except (ValueError, IndexError, TypeError):
+            raise UnsafeNetworkAddress()
+        if not address.is_global:
+            raise UnsafeNetworkAddress()
+    return answers
+
+
+def enable_dns_guard():
+    """Apply the destination check after the HTTP listener has bound its public socket."""
+    if PUBLIC or LAN:
+        # Covers redirects and manifest/segment requests made through Python networking.
+        # External downloaders are disabled in hosted mode so they cannot bypass this resolver.
+        socket.getaddrinfo = public_getaddrinfo
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stypzy Video - Sign in</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#070812;color:#f1f2fb;font:15px system-ui,sans-serif}
@@ -291,6 +320,14 @@ def reaper():
             for token, expires_at in list(AUTH_SESSIONS.items()):
                 if expires_at <= now:
                     AUTH_SESSIONS.pop(token, None)
+        with SEARCH_LOCK:
+            for key, entry in list(searches.items()):
+                record = entry.get("record") or {}
+                if record.get("status") in ("done", "error") and now - entry.get("created", now) > TTL:
+                    record.clear()
+                    searches.pop(key, None)
+        if "jobs" in globals():
+            jobs.prune(now)
         with DELETE_LOCK:
             retrying = list(PENDING_DELETE)
             PENDING_DELETE.clear()
@@ -401,6 +438,8 @@ def check_url(url):
     host = parsed.hostname
     try:
         infos = socket.getaddrinfo(host, None)
+    except UnsafeNetworkAddress:
+        raise ValueError("That address points to a private network and is blocked on this server.")
     except (OSError, ValueError):
         raise ValueError("Couldn't find that website. Check the link.")
     if not infos:
@@ -451,6 +490,8 @@ def clean_error(e):
 
 
 FRIENDLY = (
+    (("drm protected", "drm-protected", "widevine", "playready", "fairplay"), "", "This video is protected by DRM. This downloader cannot save DRM-protected streams; use the platform's official app for offline viewing."),
+    (("unsafenetworkaddress",), "", "The server blocked this request because it resolved to a private network address."),
     (("could not copy",), "login", "Your browser is still open, so Windows has locked its saved logins. Fully close that browser (also from the system tray), or choose Firefox, or upload a cookies.txt file instead."),
     (("failed to decrypt", "dpapi", "app-bound", "v20 cookie"), "login", "This browser encrypts its cookies in a way this app cannot read (newer Chrome, Edge and Brave). Choose Firefox or upload a cookies.txt file instead."),
     (("cookies database", "cookie database"), "login", "Couldn't find or open that browser's saved logins. Pick the browser you actually signed in with, or upload a cookies.txt file."),
@@ -556,10 +597,8 @@ def build_options(job, d, staging):
         opts["force_generic_extractor"] = True
     if re.search(r"(youtube\.com|youtu\.be)", str(d.get("url", ""))):
         opts["http_chunk_size"] = 10 * 1024 * 1024   # ranged chunks avoid YouTube's single-stream throttling
-    if MAX_MB:
-        opts["max_filesize"] = MAX_MB * 1048576
     # Avoid passing authenticated request headers to an external downloader process.
-    if ARIA2 and mode != "live" and not has_auth(job.get("tab", "")):
+    if ARIA2 and not PUBLIC and mode != "live" and not has_auth(job.get("tab", "")):
         # many parallel connections to the same file: the biggest speed-up on throttled sites
         opts["external_downloader"] = {"default": ARIA2}
         opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
@@ -579,24 +618,33 @@ def build_options(job, d, staging):
 class Jobs:
     def __init__(self):
         self.items, self.lock = {}, threading.Lock()
+        self.pending = queue.Queue()
+        for i in range(DOWNLOAD_WORKERS):
+            threading.Thread(target=self._worker, name=f"stypzy-download-{i + 1}", daemon=True).start()
+
+    def _worker(self):
+        while True:
+            job = self.pending.get()
+            try:
+                self.run(job)
+            finally:
+                self.pending.task_done()
 
     def create(self, d, owner=""):
         tab = owner.partition(":")[2]
         thumb = str(d.get("thumb") or "")
         job = {"id": uuid.uuid4().hex, "dl": secrets.token_urlsafe(16), "title": str(d.get("title") or d["url"])[:200],
                "thumb": thumb if thumb.startswith("http") else "", "label": str(d.get("label") or "")[:60],
-               "status": "queued", "percent": 0, "speed": None, "eta": None, "message": "Waiting for a free slot",
+               "status": "queued", "percent": 0, "speed": None, "eta": None, "message": "Queued for download",
                "error": "", "files": [], "created": time.time(), "finished": 0, "stages": 1, "staging": None,
-               "delivery_total": 0, "delivery_sent": 0, "delivery_by_file": {}, "delivery_done": set(), "delivery_active": set(),
+                "delivery_total": 0, "delivery_sent": 0, "delivery_by_file": {}, "delivery_ranges": {}, "delivery_done": set(), "delivery_active": set(),
                "cancel": threading.Event(), "stop": threading.Event(), "purged": False, "live": d.get("mode") == "live", "data": d, "owner": owner, "tab": tab, "fix": ""}
         with SESS_LOCK:
             if tab in ENDED_TABS:
                 raise PermissionError("This page session has ended. Reload the app to start a fresh session.")
             with self.lock:
-                if sum(1 for j in self.items.values() if j["owner"] == owner and j["status"] not in TERMINAL) >= MAX_ACTIVE:
-                    raise ValueError(f"You already have {MAX_ACTIVE} downloads in progress. Wait for one to finish.")
                 self.items[job["id"]] = job
-        threading.Thread(target=self.run, args=(job,), daemon=True).start()
+        self.pending.put(job)
         return job["id"]
 
     def drop(self, k):
@@ -618,11 +666,20 @@ class Jobs:
 
     def listing(self, owner=None):
         with self.lock:
-            for k in [k for k, j in self.items.items() if j["status"] in TERMINAL and time.time() - j["finished"] > TTL]:
-                self.drop(k)
-            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab", "delivery_by_file", "delivery_done", "delivery_active")},
+            self._prune_locked(time.time())
+            return [{**{k: v for k, v in j.items() if k not in ("cancel", "stop", "data", "stages", "staging", "dl", "files", "owner", "tab", "delivery_by_file", "delivery_ranges", "delivery_done", "delivery_active")},
                      "files": [{"name": n, "size": s, "url": f"/file/{j['id']}/{j['dl']}/{i}?tab={quote(j['tab'])}"} for i, (n, s) in enumerate(j["files"])]}
                     for j in sorted(self.items.values(), key=lambda j: -j["created"]) if owner is None or j["owner"] == owner]
+
+    def _prune_locked(self, now):
+        expired = [k for k, j in self.items.items()
+                   if j["status"] in TERMINAL and now - j["finished"] > TTL]
+        for key in expired:
+            self.drop(key)
+
+    def prune(self, now=None):
+        with self.lock:
+            self._prune_locked(time.time() if now is None else now)
 
     def finish(self, job, status, message, **extra):
         with self.lock:
@@ -668,53 +725,53 @@ class Jobs:
         d = job["data"]
         staging, opts, ydl = None, None, None
         try:
-            with SLOTS:
-                def check():
-                    if job["cancel"].is_set():
-                        raise DownloadCancelled("Cancelled")
-                check()
-                os.makedirs(WORK, exist_ok=True)
-                job["staging"] = staging = tempfile.mkdtemp(dir=WORK)
-                check()
-                opts, st = build_options(job, d, staging), {"file": None, "stage": -1}
-                check()
+            def check():
+                if job["cancel"].is_set():
+                    raise DownloadCancelled("Cancelled")
+            check()
+            job.update(status="downloading", message="Connecting")
+            os.makedirs(WORK, exist_ok=True)
+            job["staging"] = staging = tempfile.mkdtemp(dir=WORK)
+            check()
+            opts, st = build_options(job, d, staging), {"file": None, "stage": -1}
+            check()
 
-                def on_progress(s):
-                    check()
-                    if job["stop"].is_set():
-                        raise StopRec()
-                    if s.get("status") == "downloading":
-                        if s.get("filename") != st["file"]:
-                            st["file"], st["stage"] = s.get("filename"), st["stage"] + 1
-                        total = s.get("total_bytes") or s.get("total_bytes_estimate")
-                        done = s.get("downloaded_bytes") or 0
-                        n = job["stages"]
-                        # The first half represents fetching/preparing on the server.
-                        # The second half is reserved for sending the bytes to the browser.
-                        job["percent"] = round(min(49.9, 50 * (min(st["stage"], n - 1) + min(1, done / total)) / n), 1) if total else None
-                        job.update(speed=s.get("speed"), eta=s.get("eta"), status="downloading",
-                                   message=f"{done/1048576:.1f} MB" + (f" of {total/1048576:.1f} MB" if total else ""))
-                    elif s.get("status") == "finished":
-                        job.update(status="processing", message="Finishing up", speed=None, eta=None, percent=49.9)
-
-                opts["progress_hooks"] = [on_progress]
-                opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=49.9))]
-                job.update(status="downloading", message="Connecting")
-                try:
-                    ydl = yt_dlp.YoutubeDL(opts)
-                    with ydl:
-                        ydl.download([d["url"]])
-                except StopRec:
-                    job.update(status="processing", message="Saving your recording", speed=None, eta=None)
-                    salvage(staging)
+            def on_progress(s):
                 check()
-                files = [(n, os.path.getsize(os.path.join(staging, n))) for n in sorted(os.listdir(staging))
-                         if not n.endswith((".part", ".ytdl", ".temp", ".jpg", ".png", ".webp"))]
-                if not files:
-                    raise RuntimeError("The download finished without producing a file." + (f" It may be larger than this server's {MAX_MB} MB limit." if MAX_MB else ""))
-                job.update(delivery_total=sum(size for _, size in files), delivery_sent=0,
-                           delivery_by_file={}, delivery_done=set(), delivery_active=set())
-                self.finish(job, "ready", "Starting browser download", files=files)
+                if job["stop"].is_set():
+                    raise StopRec()
+                if s.get("status") == "downloading":
+                    if s.get("filename") != st["file"]:
+                        st["file"], st["stage"] = s.get("filename"), st["stage"] + 1
+                    total = s.get("total_bytes") or s.get("total_bytes_estimate")
+                    done = s.get("downloaded_bytes") or 0
+                    n = job["stages"]
+                    # The first half represents fetching/preparing on the server.
+                    # The second half is reserved for sending the bytes to the browser.
+                    job["percent"] = round(min(49.9, 50 * (min(st["stage"], n - 1) + min(1, done / total)) / n), 1) if total else None
+                    job.update(speed=s.get("speed"), eta=s.get("eta"), status="downloading",
+                               message=f"{done/1048576:.1f} MB" + (f" of {total/1048576:.1f} MB" if total else ""))
+                elif s.get("status") == "finished":
+                    job.update(status="processing", message="Finishing up", speed=None, eta=None, percent=49.9)
+
+            opts["progress_hooks"] = [on_progress]
+            opts["postprocessor_hooks"] = [lambda s: (check(), job.update(status="processing", message="Preparing your file", percent=49.9))]
+            job.update(status="downloading", message="Connecting")
+            try:
+                ydl = yt_dlp.YoutubeDL(opts)
+                with ydl:
+                    ydl.download([d["url"]])
+            except StopRec:
+                job.update(status="processing", message="Saving your recording", speed=None, eta=None)
+                salvage(staging)
+            check()
+            files = [(n, os.path.getsize(os.path.join(staging, n))) for n in sorted(os.listdir(staging))
+                     if not n.endswith((".part", ".ytdl", ".temp", ".jpg", ".png", ".webp"))]
+            if not files:
+                raise RuntimeError("The download finished without producing a file.")
+            job.update(delivery_total=sum(size for _, size in files), delivery_sent=0,
+                       delivery_by_file={}, delivery_ranges={}, delivery_done=set(), delivery_active=set())
+            self.finish(job, "ready", "Starting browser download", files=files)
         except BaseException as e:   # a worker thread must never take the app down
             if job["cancel"].is_set() or isinstance(e, DownloadCancelled):
                 self.finish(job, "cancelled", "Cancelled", percent=0)
@@ -740,6 +797,7 @@ class Jobs:
 
 
 jobs, searches = Jobs(), {}
+search_executor = concurrent.futures.ThreadPoolExecutor(max_workers=SEARCH_WORKERS, thread_name_prefix="stypzy-search")
 
 
 class SearchCancelled(Exception):
@@ -760,7 +818,7 @@ def extract_with_auth(url, opts, tab=""):
 def do_search(rec, url, tab="", cancel=None):
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": Live(rec, cancel), "noplaylist": True,
             "cachedir": False, "socket_timeout": 20,
-            "extract_flat": "in_playlist", "playlistend": 25 if PUBLIC else 200}
+            "extract_flat": "in_playlist"}
     if cancel and cancel.is_set():
         raise SearchCancelled()
     used_generic = False
@@ -836,6 +894,43 @@ def run_search(rec, url, tab="", cancel=None):
 
 
 atexit.register(lambda: shutil.rmtree(WORK, ignore_errors=True))
+
+
+def requested_byte_range(value, size):
+    """Parse one RFC-style byte range into a half-open interval."""
+    if not value:
+        return 0, size, False
+    match = re.fullmatch(r"bytes=(\d{0,20})-(\d{0,20})", value.strip())
+    if not match or size <= 0 or (not match.group(1) and not match.group(2)):
+        raise ValueError("Invalid byte range")
+    first, last = match.groups()
+    if not first:
+        suffix = int(last)
+        if suffix <= 0:
+            raise ValueError("Invalid byte range")
+        start, end = max(0, size - suffix), size
+    else:
+        start = int(first)
+        end = min(size, int(last) + 1) if last else size
+        if start >= size or end <= start:
+            raise ValueError("Unsatisfiable byte range")
+    return start, end, True
+
+
+def add_delivery_interval(job, file_index, start, end):
+    """Merge bytes sent for a file and return the number of unique covered bytes."""
+    intervals = sorted(job["delivery_ranges"].get(file_index, []) + [(start, end)])
+    merged = []
+    for left, right in intervals:
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    job["delivery_ranges"][file_index] = merged
+    covered = sum(right - left for left, right in merged)
+    job["delivery_by_file"][file_index] = covered
+    job["delivery_sent"] = sum(job["delivery_by_file"].values())
+    return covered
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1014,18 +1109,32 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "This file is already being sent to your browser."}, 409)
                 if track:
                     job["delivery_active"].add(file_index)
-                    job["delivery_by_file"][file_index] = 0
                     job.update(status="sending", message="Sending to your browser", speed=None, eta=None, finished=0)
         if not ok:
             return self.send_json({"error": "File expired. Download it again."}, 404)
+        try:
+            start, end, partial = requested_byte_range(self.headers.get("Range"), size)
+        except ValueError:
+            if track:
+                with jobs.lock:
+                    job["delivery_active"].discard(file_index)
+                    active = bool(job["delivery_active"])
+                    job.update(status="sending" if active else "ready",
+                               message="Sending to your browser" if active else "Ready to send",
+                               finished=0 if active else time.time())
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.nocache()
+            self.end_headers()
+            return
+        body_size = end - start
         try:
             f = open(full, "rb")
         except OSError:
             if track:
                 with jobs.lock:
                     job["delivery_active"].discard(file_index)
-                    job["delivery_by_file"].pop(file_index, None)
-                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
                     active = bool(job["delivery_active"])
                     pct = 50 + 50 * job["delivery_sent"] / max(1, job["delivery_total"])
                     job.update(status="sending" if active else "ready", percent=round(min(99.9, pct), 1),
@@ -1035,16 +1144,20 @@ class Handler(BaseHTTPRequestHandler):
         sent, started, transferred = 0, time.monotonic(), False
         with f:
             try:
-                self.send_response(200)
+                f.seek(start)
+                self.send_response(206 if partial else 200)
                 self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Length", str(body_size))
+                self.send_header("Accept-Ranges", "bytes")
+                if partial:
+                    self.send_header("Content-Range", f"bytes {start}-{end - 1}/{size}")
                 self.nocache()
-                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name, safe='')}")
                 if PUBLIC:
                     self.send_header("Strict-Transport-Security", "max-age=31536000")
                 self.end_headers()
-                while True:
-                    block = f.read(1 << 20)
+                while sent < body_size:
+                    block = f.read(min(1 << 20, body_size - sent))
                     if not block:
                         break
                     if job.get("purged") or job["cancel"].is_set():
@@ -1056,8 +1169,7 @@ class Handler(BaseHTTPRequestHandler):
                         now = time.monotonic()
                         with jobs.lock:
                             if not job.get("purged"):
-                                job["delivery_by_file"][file_index] = sent
-                                job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                                add_delivery_interval(job, file_index, start + sent - len(block), start + sent)
                                 total = max(1, job["delivery_total"])
                                 pct = min(99.9, 50 + 50 * job["delivery_sent"] / total)
                                 speed = sent / max(.001, now - started)
@@ -1065,7 +1177,7 @@ class Handler(BaseHTTPRequestHandler):
                                 job.update(percent=round(pct, 1),
                                            speed=speed, eta=left / speed if speed else None,
                                            message=f"Sending to browser: {job['delivery_sent']/1048576:.1f} of {total/1048576:.1f} MB")
-                if sent != size:
+                if sent != body_size:
                     raise ConnectionError("The browser transfer ended early.")
                 transferred = True
             except (ConnectionError, OSError, TimeoutError):
@@ -1074,24 +1186,20 @@ class Handler(BaseHTTPRequestHandler):
         if track:
             with jobs.lock:
                 job["delivery_active"].discard(file_index)
-                if transferred and not job.get("purged"):
-                    job["delivery_done"].add(file_index)
-                    job["delivery_by_file"][file_index] = size
-                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
+                if not job.get("purged"):
+                    covered = job["delivery_by_file"].get(file_index, 0)
+                    if covered >= size:
+                        job["delivery_done"].add(file_index)
                     if len(job["delivery_done"]) == len(job["files"]):
-                        job.update(status="completed", message="Saved to your browser", speed=None, eta=None,
+                        job.update(status="completed", message="Transfer sent; check your browser downloads", speed=None, eta=None,
                                     finished=time.time(), percent=100)
                     else:
-                        job.update(status="sending", message="Sending remaining files to your browser", finished=0)
-                elif not job.get("purged"):
-                    job["delivery_by_file"].pop(file_index, None)
-                    job["delivery_sent"] = sum(job["delivery_by_file"].values())
-                    active = bool(job["delivery_active"])
-                    pct = 50 + 50 * job["delivery_sent"] / max(1, job["delivery_total"])
-                    job.update(status="sending" if active else "ready", percent=round(min(99.9, pct), 1),
-                                speed=None, eta=None,
-                                message="Transfer interrupted; choose Save to retry." if not active else "Sending to your browser",
-                                finished=0 if active else time.time())
+                        active = bool(job["delivery_active"])
+                        pct = 50 + 50 * job["delivery_sent"] / max(1, job["delivery_total"])
+                        job.update(status="sending" if active else "ready", percent=round(min(99.9, pct), 1),
+                                   speed=None, eta=None,
+                                   message=("Transfer sent; waiting for remaining file bytes" if transferred else "Transfer interrupted; retry or resume the browser download") if not active else "Sending to your browser",
+                                   finished=0 if active else time.time())
 
     def handle_request(self, method):
         path = urlparse(self.path).path
@@ -1143,9 +1251,13 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/jobs":
                     return self.send_json({"jobs": jobs.listing(self.owner())})
                 if path.startswith("/api/search/"):
+                    key = path.rsplit("/", 1)[-1]
                     with SEARCH_LOCK:
-                        entry = searches.get(path.rsplit("/", 1)[-1])
+                        entry = searches.get(key)
                         rec = dict(entry["record"]) if entry and entry["owner"] == self.owner() else None
+                        if rec is not None and rec.get("status") in ("done", "error"):
+                            entry["record"].clear()
+                            searches.pop(key, None)
                     return self.send_json(rec if rec is not None else {"error": "Unknown search"}, 200 if rec is not None else 404)
                 return self.send_json({"error": "Not found"}, 404)
             data = self.read_json()
@@ -1162,13 +1274,14 @@ class Handler(BaseHTTPRequestHandler):
                     if tab in ENDED_TABS:
                         return self.send_json({"error": "This page session has ended. Reload the app to start a fresh session."}, 410)
                     with SEARCH_LOCK:
-                        searches[sid] = {"record": rec, "owner": self.owner(), "tab": tab, "cancel": cancel}
-                        while len(searches) > 100:  # keep memory bounded
-                            old_key = next(iter(searches))
-                            old = searches.pop(old_key)
-                            old["cancel"].set()
-                            old["record"].clear()
-                threading.Thread(target=run_search, args=(rec, url, tab, cancel), daemon=True).start()
+                        for old_key, old in list(searches.items()):
+                            if old["tab"] == tab:
+                                old["cancel"].set()
+                                old["record"].clear()
+                                searches.pop(old_key, None)
+                        searches[sid] = {"record": rec, "owner": self.owner(), "tab": tab,
+                                         "cancel": cancel, "created": time.time()}
+                search_executor.submit(run_search, rec, url, tab, cancel)
                 return self.send_json({"id": sid})
             if path == "/api/download":
                 if not url.startswith(("https://", "http://")):
@@ -1332,6 +1445,29 @@ class Handler(BaseHTTPRequestHandler):
     do_POST = lambda self: self.handle_request("POST")
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Keep slow or bursty clients from creating an unbounded number of request threads."""
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(64)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def main():
     if PUBLIC and len(APP_PASSWORD) < 16:
         fatal("Hosted mode requires APP_PASSWORD to be set to a strong value of at least 16 characters. Add it in Render Environment settings, then redeploy.")
@@ -1339,7 +1475,7 @@ def main():
     ports = [int(os.environ["PORT"])] if (PUBLIC and os.environ.get("PORT")) else range(8765, 8785)
     for port in ports:
         try:
-            server = ThreadingHTTPServer(("0.0.0.0" if (LAN or PUBLIC) else "127.0.0.1", port), Handler)
+            server = BoundedThreadingHTTPServer(("0.0.0.0" if (LAN or PUBLIC) else "127.0.0.1", port), Handler)
             break
         except OSError:
             continue
@@ -1356,7 +1492,8 @@ def main():
     if LAN:
         lan_ip, extra = lan_hosts(port)
         ALLOWED_HOSTS.update(extra)
-    shutil.rmtree(WORK, ignore_errors=True)
+    enable_dns_guard()
+    os.makedirs(WORK, exist_ok=True)
     threading.Thread(target=check_latest, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
     print(f"Stypzy Video running at http://127.0.0.1:{port}  (FFmpeg: {'yes' if FFMPEG else 'no'}, aria2c: {'yes' if ARIA2 else 'no'})", flush=True)
